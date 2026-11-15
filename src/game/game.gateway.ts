@@ -11,8 +11,10 @@ import { Server, Socket } from 'socket.io';
 import { GameService } from './game.service';
 
 @WebSocketGateway({
-  cors: { origin: '*' },
-  path: '/socket.io',
+  // The API gateway routes this path here and requires a valid token on it.
+  path: '/ws/game',
+  // Without long polling a connection needs no sticky session between the instances.
+  transports: ['websocket'],
 })
 export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
