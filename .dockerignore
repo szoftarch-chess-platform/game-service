@@ -1,0 +1,13 @@
+# Only the sources and the package files are needed to build the image.
+node_modules/
+dist/
+coverage/
+.git/
+.claude/
+docs/
+*.md
+.env
+.env.*
+Dockerfile
+.dockerignore
+.gitignore

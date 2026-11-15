@@ -15,11 +15,11 @@ async function bootstrap() {
 
   const app = await NestFactory.create(AppModule);
 
-  app.setGlobalPrefix('api');
-  app.enableCors();
-
   await app.listen(port);
-  console.log(`Game Service is running on: http://localhost:${port}/api`);
+  console.log(`Game Service is listening on port ${port}`);
 }
 
-bootstrap();
+bootstrap().catch((error: unknown) => {
+  console.error(error);
+  process.exit(1);
+});
