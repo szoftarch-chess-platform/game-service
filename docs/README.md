@@ -19,7 +19,7 @@
 ## Next steps
 
 - Read the user from `x-user-id` and `x-user-name` of the handshake (ADR-4), and read `REDIS_URL`, `RABBITMQ_URL` and `ENGINE_URL` as required settings (ADR-6).
-- Describe in the README how the service runs on the host against Redis and RabbitMQ of the infra compose, with `ENGINE_URL` pointing to an engine-service on the host or to a fake of it (ADR-6).
+- Describe in the README how the service runs on the host against Redis and RabbitMQ of the infra compose, with the Redis user `game-service` and the password `GAME_REDIS_PASSWORD` of the infra `.env` in `REDIS_URL`, with `ENGINE_URL` pointing to the engine-service of the infra compose at http://localhost:8000 (ADR-6).
 - Replace the stub events with the events of the contract `game-service.asyncapi.yaml` of the infra repo, with their acknowledgements and error codes, and update the README.
 - Keep the queue, the games and the outbox in Redis, add the Redis adapter of Socket.IO (ADR-3), and send the events of a game to every connection of its players (ADR-10).
 - Check the moves and the end of the game with chess.js (ADR-9), and run the clock of ADR-10.
