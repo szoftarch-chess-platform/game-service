@@ -10,7 +10,7 @@ The service runs as a container image, which the CI and the compose of the infra
 
 - The multi-stage `Dockerfile` builds the service with `node:26-alpine`. The final stage starts from the same image and installs only the runtime dependencies with `npm ci --omit=dev`.
 - The service runs as the non-root user `node`, and `node` starts it directly, not through npm.
-- The image sets no port. The service listens on the port of the required `PORT` environment variable.
+- The image sets no port or address. The service listens on the port of the required `PORT` environment variable and on the address of the required `HOST` environment variable, which compose sets to `0.0.0.0`.
 - The image has no `HEALTHCHECK`. The compose of the infra repo checks `GET /health`, which is the only HTTP endpoint of the service.
 
 ## Rationale

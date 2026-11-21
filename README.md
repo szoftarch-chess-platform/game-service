@@ -36,7 +36,13 @@ Define the required variables in `.env` or in the container environment:
 ```ini
 # .env
 PORT=3001
+HOST=127.0.0.1
 ```
+
+| Variable | Description |
+|---|---|
+| `PORT` | port that the service listens on |
+| `HOST` | address that the service listens on, `127.0.0.1` on the host and `0.0.0.0` in a container |
 
 A template file [`.env.example`](.env.example) is provided in the repository with empty values for all required keys.
 
@@ -85,7 +91,10 @@ npm test
 ```bash
 npm run start:dev
 ```
-The application will listen on the port specified in `.env`.
+The application will listen on the address and the port specified in `.env`.
+
+### 5. Run Behind the Gateway
+Keep `PORT=3001`, the port of the container, and add `compose.game-on-host.yaml` to the compose files as the README of the infra repo describes for a service on the host. The gateway at https://localhost:8443 then sends `/ws/game` and `/ws/spectate` to this process. On Linux set `HOST` to the address of the Docker bridge that the README of the infra repo describes.
 
 ---
 
@@ -93,7 +102,7 @@ The application will listen on the port specified in `.env`.
 
 ```bash
 docker build -t game-service .
-docker run --rm --init -e PORT=3001 -p 3001:3001 game-service
+docker run --rm --init -e PORT=3001 -e HOST=0.0.0.0 -p 127.0.0.1:3001:3001 game-service
 ```
 
 [GS-ADR-1](docs/adr/container-image.md) describes the image.
