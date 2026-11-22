@@ -1,11 +1,7 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import Redis from 'ioredis';
 import { AppConfigService } from '../config/config.service';
-import {
-  GameState,
-  GameFinishedEvent,
-  UserPlayer,
-} from '../domain/types';
+import { GameState, GameFinishedEvent, UserPlayer } from '../domain/types';
 
 export interface UserStatus {
   status: 'idle' | 'queue' | 'game';
@@ -62,9 +58,10 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
    * Atomically joins the queue if the user is not already queued or in a game.
    * If at least 2 players are in queue, pops the two oldest (FIFO) and returns them.
    */
-  async joinQueue(
-    player: UserPlayer,
-  ): Promise<{ error?: 'alreadyInQueue' | 'alreadyInGame'; matched?: [UserPlayer, UserPlayer] }> {
+  async joinQueue(player: UserPlayer): Promise<{
+    error?: 'alreadyInQueue' | 'alreadyInGame';
+    matched?: [UserPlayer, UserPlayer];
+  }> {
     const joinScript = `
       local userId = KEYS[1]
       local playerJson = ARGV[1]
@@ -151,9 +148,15 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     // Set clock deadline if clock is running
     if (game.clock.running) {
       const remainingMs =
-        game.clock.running === 'white' ? game.clock.whiteMs ?? 600000 : game.clock.blackMs ?? 600000;
+        game.clock.running === 'white'
+          ? (game.clock.whiteMs ?? 600000)
+          : (game.clock.blackMs ?? 600000);
       const deadline = Date.now() + remainingMs;
-      pipeline.zadd('game:deadlines', deadline, `${game.gameId}:${game.clock.running}`);
+      pipeline.zadd(
+        'game:deadlines',
+        deadline,
+        `${game.gameId}:${game.clock.running}`,
+      );
     }
 
     await pipeline.exec();
@@ -182,7 +185,11 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     pipeline.set(`game:${game.gameId}`, JSON.stringify(game));
 
     // Clear any existing deadlines for this game
-    pipeline.zrem('game:deadlines', `${game.gameId}:white`, `${game.gameId}:black`);
+    pipeline.zrem(
+      'game:deadlines',
+      `${game.gameId}:white`,
+      `${game.gameId}:black`,
+    );
 
     if (isFinished) {
       if (game.white.kind === 'user') {
@@ -198,10 +205,14 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       if (game.clock.running) {
         const remainingMs =
           game.clock.running === 'white'
-            ? game.clock.whiteMs ?? 600000
-            : game.clock.blackMs ?? 600000;
+            ? (game.clock.whiteMs ?? 600000)
+            : (game.clock.blackMs ?? 600000);
         const deadline = Date.now() + remainingMs;
-        pipeline.zadd('game:deadlines', deadline, `${game.gameId}:${game.clock.running}`);
+        pipeline.zadd(
+          'game:deadlines',
+          deadline,
+          `${game.gameId}:${game.clock.running}`,
+        );
       }
     }
 

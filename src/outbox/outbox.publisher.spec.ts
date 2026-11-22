@@ -88,9 +88,11 @@ describe('OutboxPublisher', () => {
     };
 
     mockRedis.popOutboxEvent.mockResolvedValueOnce(testEvent);
-    mockChannel.publish = vi.fn((exchange, routingKey, buffer, options, callback) => {
-      callback(new Error('NACK'));
-    });
+    mockChannel.publish = vi.fn(
+      (exchange, routingKey, buffer, options, callback) => {
+        callback(new Error('NACK'));
+      },
+    );
 
     await publisher.drainOutbox();
 

@@ -4,7 +4,8 @@ import { ChessRules } from './chess-rules';
 import { UserPlayer, BotPlayer } from './types';
 
 describe('ChessRules', () => {
-  const startingFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+  const startingFen =
+    'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
   it('should accept a legal opening move', () => {
     const result = ChessRules.applyMove(startingFen, 'e2e4');
@@ -27,7 +28,8 @@ describe('ChessRules', () => {
 
   it('should handle castling correctly', () => {
     // Setup position where white can castle kingside
-    const fen = 'rnbqk2r/pppp1ppp/5n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4';
+    const fen =
+      'rnbqk2r/pppp1ppp/5n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4';
     const result = ChessRules.applyMove(fen, 'e1g1');
     expect(result.valid).toBe(true);
     expect(result.fen).toContain('RNBQ1RK1');
@@ -87,8 +89,14 @@ describe('ChessRules', () => {
   it('should detect threefold repetition with move history', () => {
     // 1. Nf3 Nf6 2. Ng1 Ng8 3. Nf3 Nf6 4. Ng1 Ng8
     const moves = [
-      'g1f3', 'g8f6', 'f3g1', 'f6g8',
-      'g1f3', 'g8f6', 'f3g1', 'f6g8',
+      'g1f3',
+      'g8f6',
+      'f3g1',
+      'f6g8',
+      'g1f3',
+      'g8f6',
+      'f3g1',
+      'f6g8',
     ];
 
     let currentFen = startingFen;
@@ -155,8 +163,16 @@ describe('ChessRules', () => {
   });
 
   describe('Clock handling', () => {
-    const userWhite: UserPlayer = { kind: 'user', userId: 'user-1', name: 'Alice' };
-    const userBlack: UserPlayer = { kind: 'user', userId: 'user-2', name: 'Bob' };
+    const userWhite: UserPlayer = {
+      kind: 'user',
+      userId: 'user-1',
+      name: 'Alice',
+    };
+    const userBlack: UserPlayer = {
+      kind: 'user',
+      userId: 'user-2',
+      name: 'Bob',
+    };
     const bot: BotPlayer = { kind: 'bot', name: 'Stockfish bot' };
 
     it('creates initial clock for human vs human game', () => {
@@ -174,7 +190,11 @@ describe('ChessRules', () => {
     });
 
     it('updates clock after white moves against bot', () => {
-      const initialClock = ChessRules.createInitialClock(userWhite, bot, 600000);
+      const initialClock = ChessRules.createInitialClock(
+        userWhite,
+        bot,
+        600000,
+      );
       const { updatedClock, timedOut } = ChessRules.updateClockOnMove(
         initialClock,
         userWhite,
@@ -188,7 +208,11 @@ describe('ChessRules', () => {
     });
 
     it('detects timeout on move if time exceeded and unsets running', () => {
-      const initialClock = ChessRules.createInitialClock(userWhite, userBlack, 600000);
+      const initialClock = ChessRules.createInitialClock(
+        userWhite,
+        userBlack,
+        600000,
+      );
       const { updatedClock, timedOut } = ChessRules.updateClockOnMove(
         initialClock,
         userWhite,

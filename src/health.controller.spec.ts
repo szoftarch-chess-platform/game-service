@@ -14,6 +14,9 @@ describe('HealthController', () => {
   });
 
   it('should report that the service is running', () => {
-    expect(healthController.getHealth()).toEqual({ status: 'ok', service: 'game-service' });
+    expect(healthController.getHealth()).toEqual({
+      status: 'ok',
+      service: 'game-service',
+    });
   });
 });

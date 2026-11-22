@@ -43,7 +43,12 @@ export class GameService {
     return publicGame;
   }
 
-  private broadcastToUsers(userIds: string[], event: string, payload: any, gameId?: string) {
+  private broadcastToUsers(
+    userIds: string[],
+    event: string,
+    payload: any,
+    gameId?: string,
+  ) {
     if (!this.server) return;
     for (const uid of userIds) {
       this.server.to(`user:${uid}`).emit(event, payload);
@@ -106,13 +111,19 @@ export class GameService {
     if (status.status === 'queue') {
       return {
         ok: false,
-        error: { code: 'alreadyInQueue', message: 'User is currently in queue.' },
+        error: {
+          code: 'alreadyInQueue',
+          message: 'User is currently in queue.',
+        },
       };
     }
     if (status.status === 'game') {
       return {
         ok: false,
-        error: { code: 'alreadyInGame', message: 'User is already in an active game.' },
+        error: {
+          code: 'alreadyInGame',
+          message: 'User is already in an active game.',
+        },
       };
     }
 
@@ -198,8 +209,14 @@ export class GameService {
   /**
    * Processes a move from a human player.
    */
-  async makeMove(userId: string, gameId: string, uciMove: string): Promise<OperationResponse> {
-    const game = (await this.redisService.getGame(gameId)) as ExtendedGameState | null;
+  async makeMove(
+    userId: string,
+    gameId: string,
+    uciMove: string,
+  ): Promise<OperationResponse> {
+    const game = (await this.redisService.getGame(
+      gameId,
+    )) as ExtendedGameState | null;
     if (!game) {
       return {
         ok: false,
@@ -213,12 +230,18 @@ export class GameService {
     if (!isWhite && !isBlack) {
       return {
         ok: false,
-        error: { code: 'gameNotFound', message: `User is not a player in game ${gameId}.` },
+        error: {
+          code: 'gameNotFound',
+          message: `User is not a player in game ${gameId}.`,
+        },
       };
     }
 
-    const currentTurnColor: Color = game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
-    const isUserTurn = (isWhite && currentTurnColor === 'white') || (isBlack && currentTurnColor === 'black');
+    const currentTurnColor: Color =
+      game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
+    const isUserTurn =
+      (isWhite && currentTurnColor === 'white') ||
+      (isBlack && currentTurnColor === 'black');
     if (!isUserTurn) {
       return {
         ok: false,
@@ -228,7 +251,8 @@ export class GameService {
 
     // Calculate elapsed time
     const now = Date.now();
-    const lastTimestamp = game.lastMoveTimestamp ?? new Date(game.startedAt).getTime();
+    const lastTimestamp =
+      game.lastMoveTimestamp ?? new Date(game.startedAt).getTime();
     const elapsedMs = Math.max(0, now - lastTimestamp);
 
     const { updatedClock, timedOut } = ChessRules.updateClockOnMove(
@@ -245,7 +269,12 @@ export class GameService {
 
     if (timedOut) {
       const evalRes = ChessRules.evaluateTimeout(game.fen, currentTurnColor);
-      await this.finalizeGame(game, evalRes.result, evalRes.reason, updatedClock);
+      await this.finalizeGame(
+        game,
+        evalRes.result,
+        evalRes.reason,
+        updatedClock,
+      );
       return { ok: true };
     }
 
@@ -286,12 +315,18 @@ export class GameService {
 
     if (moveResult.isGameOver) {
       // Game over by checkmate, stalemate, repetition, 50-move, or insufficient material
-      await this.finalizeGame(game, moveResult.result!, moveResult.reason!, game.clock);
+      await this.finalizeGame(
+        game,
+        moveResult.result!,
+        moveResult.reason!,
+        game.clock,
+      );
     } else {
       await this.redisService.saveGameState(game, false);
 
       // Check if next turn is the bot
-      const nextTurnColor: Color = game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
+      const nextTurnColor: Color =
+        game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
       const nextPlayer = nextTurnColor === 'white' ? game.white : game.black;
       if (nextPlayer.kind === 'bot') {
         this.executeBotMoveAsync(game).catch((err) => {
@@ -376,7 +411,9 @@ export class GameService {
    * User resigns current game.
    */
   async resign(userId: string, gameId: string): Promise<OperationResponse> {
-    const game = (await this.redisService.getGame(gameId)) as ExtendedGameState | null;
+    const game = (await this.redisService.getGame(
+      gameId,
+    )) as ExtendedGameState | null;
     if (!game) {
       return {
         ok: false,
@@ -389,7 +426,10 @@ export class GameService {
     if (!isWhite && !isBlack) {
       return {
         ok: false,
-        error: { code: 'gameNotFound', message: `User is not in game ${gameId}.` },
+        error: {
+          code: 'gameNotFound',
+          message: `User is not in game ${gameId}.`,
+        },
       };
     }
 
@@ -404,7 +444,9 @@ export class GameService {
    * Handles timeout triggered by background clock service.
    */
   async handleTimeout(gameId: string, timedOutColor: Color) {
-    const game = (await this.redisService.getGame(gameId)) as ExtendedGameState | null;
+    const game = (await this.redisService.getGame(
+      gameId,
+    )) as ExtendedGameState | null;
     if (!game) return;
 
     if (timedOutColor === 'white') {
@@ -415,7 +457,12 @@ export class GameService {
     delete game.clock.running;
 
     const evalResult = ChessRules.evaluateTimeout(game.fen, timedOutColor);
-    await this.finalizeGame(game, evalResult.result, evalResult.reason, game.clock);
+    await this.finalizeGame(
+      game,
+      evalResult.result,
+      evalResult.reason,
+      game.clock,
+    );
   }
 
   /**
@@ -478,7 +525,9 @@ export class GameService {
       return { ok: true, queued: true };
     }
     if (status.status === 'game' && status.gameId) {
-      const game = (await this.redisService.getGame(status.gameId)) as ExtendedGameState | null;
+      const game = (await this.redisService.getGame(
+        status.gameId,
+      )) as ExtendedGameState | null;
       if (game) {
         return { ok: true, queued: false, game: this.toPublicGameState(game) };
       }

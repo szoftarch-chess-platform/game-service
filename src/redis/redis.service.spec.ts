@@ -48,7 +48,9 @@ describe('RedisService', () => {
   });
 
   it('reports user as in game when status is game:id', async () => {
-    mockRedis.get.mockResolvedValue('game:0193c2bf-0a1b-7c2d-9e3f-4a5b6c7d8e9f');
+    mockRedis.get.mockResolvedValue(
+      'game:0193c2bf-0a1b-7c2d-9e3f-4a5b6c7d8e9f',
+    );
     const status = await service.getUserStatus('user-1');
     expect(status.status).toBe('game');
     expect(status.gameId).toBe('0193c2bf-0a1b-7c2d-9e3f-4a5b6c7d8e9f');
@@ -56,14 +58,22 @@ describe('RedisService', () => {
 
   it('prevents user from joining queue if already in queue', async () => {
     mockRedis.eval.mockResolvedValue(['error', 'alreadyInQueue']);
-    const player: UserPlayer = { kind: 'user', userId: 'user-1', name: 'Alice' };
+    const player: UserPlayer = {
+      kind: 'user',
+      userId: 'user-1',
+      name: 'Alice',
+    };
     const result = await service.joinQueue(player);
     expect(result.error).toBe('alreadyInQueue');
   });
 
   it('prevents user from joining queue if already in game', async () => {
     mockRedis.eval.mockResolvedValue(['error', 'alreadyInGame']);
-    const player: UserPlayer = { kind: 'user', userId: 'user-1', name: 'Alice' };
+    const player: UserPlayer = {
+      kind: 'user',
+      userId: 'user-1',
+      name: 'Alice',
+    };
     const result = await service.joinQueue(player);
     expect(result.error).toBe('alreadyInGame');
   });
@@ -72,7 +82,11 @@ describe('RedisService', () => {
     const p1: UserPlayer = { kind: 'user', userId: 'user-1', name: 'Alice' };
     const p2: UserPlayer = { kind: 'user', userId: 'user-2', name: 'Bob' };
 
-    mockRedis.eval.mockResolvedValue(['matched', JSON.stringify(p1), JSON.stringify(p2)]);
+    mockRedis.eval.mockResolvedValue([
+      'matched',
+      JSON.stringify(p1),
+      JSON.stringify(p2),
+    ]);
 
     const result = await service.joinQueue(p2);
     expect(result.matched).toBeDefined();
@@ -109,9 +123,18 @@ describe('RedisService', () => {
 
     await service.createGame(game);
     const pipelineMock = mockRedis.pipeline();
-    expect(pipelineMock.set).toHaveBeenCalledWith('game:game-1', JSON.stringify(game));
-    expect(pipelineMock.set).toHaveBeenCalledWith('user:status:user-1', 'game:game-1');
-    expect(pipelineMock.set).toHaveBeenCalledWith('user:status:user-2', 'game:game-1');
+    expect(pipelineMock.set).toHaveBeenCalledWith(
+      'game:game-1',
+      JSON.stringify(game),
+    );
+    expect(pipelineMock.set).toHaveBeenCalledWith(
+      'user:status:user-1',
+      'game:game-1',
+    );
+    expect(pipelineMock.set).toHaveBeenCalledWith(
+      'user:status:user-2',
+      'game:game-1',
+    );
     expect(pipelineMock.zadd).toHaveBeenCalled();
   });
 });

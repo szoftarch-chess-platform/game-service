@@ -1,4 +1,11 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit, Inject, forwardRef } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+  Inject,
+  forwardRef,
+} from '@nestjs/common';
 import { RedisService } from '../redis/redis.service';
 import { GameService } from '../game/game.service';
 import { Color } from '../domain/types';

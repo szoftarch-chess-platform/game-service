@@ -30,7 +30,10 @@ describe('GameService', () => {
       }),
     };
 
-    service = new GameService(mockRedis as RedisService, mockEngine as EngineClient);
+    service = new GameService(
+      mockRedis as RedisService,
+      mockEngine as EngineClient,
+    );
     service.setServer(mockServer);
   });
 
@@ -221,7 +224,10 @@ describe('GameService', () => {
 
     it('returns active game when user is in game', async () => {
       const activeGame = { gameId: 'g1' } as any;
-      mockRedis.getUserStatus.mockResolvedValue({ status: 'game', gameId: 'g1' });
+      mockRedis.getUserStatus.mockResolvedValue({
+        status: 'game',
+        gameId: 'g1',
+      });
       mockRedis.getGame.mockResolvedValue(activeGame);
 
       const res = await service.getState('user-1');
