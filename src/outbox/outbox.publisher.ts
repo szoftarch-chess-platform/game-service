@@ -1,4 +1,9 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import * as amqp from 'amqplib';
 import { AppConfigService } from '../config/config.service';
 import { RedisService } from '../redis/redis.service';
@@ -64,10 +69,14 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
 
       this.connection = conn;
       this.channel = confirmChannel;
-      this.logger.log('Connected to RabbitMQ and declared exchange game.events');
+      this.logger.log(
+        'Connected to RabbitMQ and declared exchange game.events',
+      );
       return true;
     } catch (err: any) {
-      this.logger.warn(`Failed to connect to RabbitMQ: ${err.message}. Retrying in 5s...`);
+      this.logger.warn(
+        `Failed to connect to RabbitMQ: ${err.message}. Retrying in 5s...`,
+      );
       setTimeout(() => this.connect(), 5000);
       return false;
     }
@@ -77,7 +86,8 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
    * Drains events from the Redis outbox list and publishes them with publisher confirms.
    */
   async drainOutbox() {
-    if (this.isDraining || !this.channel || Date.now() < this.nextDrainTime) return;
+    if (this.isDraining || !this.channel || Date.now() < this.nextDrainTime)
+      return;
     this.isDraining = true;
 
     try {
@@ -110,7 +120,9 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
 
       const returnHandler = (msg: amqp.ConsumeMessage) => {
         if (msg.properties.messageId === event.id) {
-          this.logger.warn(`Message returned by broker (unroutable, waiting for consumer queue): ${event.id}`);
+          this.logger.warn(
+            `Message returned by broker (unroutable, waiting for consumer queue): ${event.id}`,
+          );
           returned = true;
         }
       };
@@ -135,11 +147,15 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
           this.channel.removeListener('return', returnHandler);
 
           if (err || returned) {
-            const reason = err?.message ?? 'No consumer queue bound to game.finished (mandatory return)';
+            const reason =
+              err?.message ??
+              'No consumer queue bound to game.finished (mandatory return)';
             this.logger.error(`Failed to publish event ${event.id}: ${reason}`);
             resolve(false);
           } else {
-            this.logger.log(`Confirmed event publication to game.finished: ${event.id}`);
+            this.logger.log(
+              `Confirmed event publication to game.finished: ${event.id}`,
+            );
             resolve(true);
           }
         },

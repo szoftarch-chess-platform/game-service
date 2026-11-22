@@ -8,6 +8,7 @@ Game service of the online chess platform. Its responsibilities are decided in A
 
 ```
 game-service/
+├── .github/workflows/        # CI workflow
 ├── src/
 │   ├── main.ts                   # Entry point
 │   ├── app.module.ts             # Root module (imports GameModule)
@@ -106,6 +107,19 @@ docker run --rm --init -e PORT=3001 -e HOST=0.0.0.0 -p 127.0.0.1:3001:3001 game-
 ```
 
 [GS-ADR-1](docs/adr/container-image.md) describes the image.
+
+---
+
+## 🔄 CI
+
+The workflow in `.github/workflows/game-service.yml` runs the format check, the tests and the build on every pull request and every push to `dev` and `main`, and it builds the image. A tag such as `v1.0.0` also publishes the image for amd64 and arm64 as `ghcr.io/szoftarch-chess-platform/game-service:1.0.0`, as ADR-2 decides.
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+After its first publication the package can be private. Make it public once in the package settings on GitHub.
 
 ---
 

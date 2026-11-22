@@ -25,8 +25,8 @@
 - ✅ Sakkóra (10 perc kezdő, nincs inkrementum, bot óra kezelés, FIDE 6.9 döntetlen timeout esetén elégtelen anyaggal) és Redis Sorted Set alapú háttérfigyelő (ADR-10).
 - ✅ Engine-service integráció `POST /moves` hívással, 15s timeouttal és 1 retry-val 500-as hiba esetén, motorkudarc esetén `aborted` / `engineFailure` lezárással (ADR-6, ADR-10).
 - ✅ Tranzakcionális outbox Redisben és megbízható RabbitMQ közzététel a `game.events` topic exchange-re `game.finished` routing key-jel és publisher confirm-mel (ADR-6).
+- ✅ CI workflow in `.github/workflows/game-service.yml` for tests, format checks, builds and GHCR publishing on tags (ADR-2).
 
 ## Next steps
 
-- Add the CI workflow of ADR-2.
-- GHCR container image publish.
+- GHCR container image publish on first release tag.

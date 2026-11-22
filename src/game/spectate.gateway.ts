@@ -14,7 +14,9 @@ import { Socket } from 'socket.io';
   // Without long polling a connection needs no sticky session between the instances.
   transports: ['websocket'],
 })
-export class SpectateGateway implements OnGatewayConnection, OnGatewayDisconnect {
+export class SpectateGateway
+  implements OnGatewayConnection, OnGatewayDisconnect
+{
   handleConnection(client: Socket) {
     // Spectator connected
   }
@@ -24,7 +26,10 @@ export class SpectateGateway implements OnGatewayConnection, OnGatewayDisconnect
   }
 
   @SubscribeMessage('spectateGame')
-  handleSpectateGame(@ConnectedSocket() client: Socket, @MessageBody() data: any) {
+  handleSpectateGame(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: any,
+  ) {
     if (data && typeof data.gameId === 'string') {
       client.join(`game:${data.gameId}`);
       return { ok: true };

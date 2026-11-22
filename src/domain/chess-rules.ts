@@ -1,11 +1,5 @@
 import { Chess } from 'chess.js';
-import {
-  Color,
-  GameEndReason,
-  GameResult,
-  Player,
-  Clock,
-} from './types';
+import { Color, GameEndReason, GameResult, Player, Clock } from './types';
 
 export interface MoveExecutionResult {
   valid: boolean;
@@ -234,7 +228,11 @@ export class ChessRules {
   /**
    * Returns the initial clock state for a newly started game.
    */
-  static createInitialClock(white: Player, black: Player, initialMs = 600000): Clock {
+  static createInitialClock(
+    white: Player,
+    black: Player,
+    initialMs = 600000,
+  ): Clock {
     const clock: Clock = {};
     if (white.kind === 'user') {
       clock.whiteMs = initialMs;

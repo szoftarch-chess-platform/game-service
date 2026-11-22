@@ -21,7 +21,12 @@ function isObject(val: any): boolean {
 }
 
 function normalizePayload(data: any): any {
-  if (typeof data === 'function' || data === undefined || data === null || data === '') {
+  if (
+    typeof data === 'function' ||
+    data === undefined ||
+    data === null ||
+    data === ''
+  ) {
     return {};
   }
   if (typeof data === 'string') {
@@ -40,7 +45,9 @@ function normalizePayload(data: any): any {
   // Without long polling a connection needs no sticky session between the instances.
   transports: ['websocket'],
 })
-export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
+export class GameGateway
+  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
+{
   @WebSocketServer()
   server!: Server;
 
@@ -148,10 +155,17 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     @MessageBody() rawData: any,
   ): Promise<OperationResponse> {
     const data = normalizePayload(rawData);
-    if (!isObject(data) || typeof data.gameId !== 'string' || !UUID_REGEX.test(data.gameId)) {
+    if (
+      !isObject(data) ||
+      typeof data.gameId !== 'string' ||
+      !UUID_REGEX.test(data.gameId)
+    ) {
       return {
         ok: false,
-        error: { code: 'invalidPayload', message: 'Valid gameId (UUID) is required.' },
+        error: {
+          code: 'invalidPayload',
+          message: 'Valid gameId (UUID) is required.',
+        },
       };
     }
     const { userId } = client.data;

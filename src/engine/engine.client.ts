@@ -17,7 +17,10 @@ export class EngineClient {
    * Calls engine-service POST /moves to get a move for the given FEN.
    * Enforces a 15-second timeout and 1 retry on 500 or network failure (ADR-6).
    */
-  async requestMove(fen: string, variant = 'standard'): Promise<EngineMoveResponse> {
+  async requestMove(
+    fen: string,
+    variant = 'standard',
+  ): Promise<EngineMoveResponse> {
     const url = `${this.config.engineUrl}/moves`;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -42,7 +45,9 @@ export class EngineClient {
         }
 
         const status = response.status;
-        this.logger.warn(`Engine service returned HTTP ${status} on attempt ${attempt}`);
+        this.logger.warn(
+          `Engine service returned HTTP ${status} on attempt ${attempt}`,
+        );
 
         // If client error (400 or 422), do not retry (ADR-6 / OpenAPI contract notes repeating gets same answer)
         if (status === 400 || status === 422) {
@@ -60,7 +65,9 @@ export class EngineClient {
           };
         }
       } catch (err: any) {
-        this.logger.error(`Engine request failed on attempt ${attempt}: ${err.message}`);
+        this.logger.error(
+          `Engine request failed on attempt ${attempt}: ${err.message}`,
+        );
         if (attempt === 2) {
           return {
             success: false,
