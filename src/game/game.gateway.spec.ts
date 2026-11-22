@@ -61,11 +61,12 @@ describe('GameGateway', () => {
     });
 
     it('delegates valid makeMove to service', async () => {
-      const res = await gateway.handleMakeMove(mockSocket, { gameId: 'g1', move: 'e2e4' });
+      const validGameId = '0193c2bf-0a1b-7c2d-9e3f-4a5b6c7d8e9f';
+      const res = await gateway.handleMakeMove(mockSocket, { gameId: validGameId, move: 'e2e4' });
       expect(res.ok).toBe(true);
       expect(mockGameService.makeMove).toHaveBeenCalledWith(
         '0193c2b4-7d3e-7c2a-9f1e-3b5a6c7d8e9f',
-        'g1',
+        validGameId,
         'e2e4',
       );
     });

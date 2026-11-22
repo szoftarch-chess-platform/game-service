@@ -227,7 +227,7 @@ describe('GameService', () => {
       const res = await service.getState('user-1');
       expect(res.ok).toBe(true);
       expect(res.queued).toBe(false);
-      expect(res.game).toBe(activeGame);
+      expect(res.game).toEqual(activeGame);
     });
 
     it('returns queued: false when idle', async () => {

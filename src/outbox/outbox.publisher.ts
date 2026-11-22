@@ -11,6 +11,7 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
   private channel: any = null;
   private drainInterval: NodeJS.Timeout | null = null;
   private isDraining = false;
+  private nextDrainTime = 0;
 
   constructor(
     private readonly config: AppConfigService,
@@ -76,7 +77,7 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
    * Drains events from the Redis outbox list and publishes them with publisher confirms.
    */
   async drainOutbox() {
-    if (this.isDraining || !this.channel) return;
+    if (this.isDraining || !this.channel || Date.now() < this.nextDrainTime) return;
     this.isDraining = true;
 
     try {
@@ -86,6 +87,8 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
         if (!published) {
           // Requeue back into Redis outbox if broker did not accept or confirm
           await this.redisService.requeueOutboxEvent(event);
+          // Wait 5 seconds before retrying to prevent rapid log flooding
+          this.nextDrainTime = Date.now() + 5000;
           break;
         }
       }
@@ -107,7 +110,7 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
 
       const returnHandler = (msg: amqp.ConsumeMessage) => {
         if (msg.properties.messageId === event.id) {
-          this.logger.warn(`Message returned by broker (unroutable): ${event.id}`);
+          this.logger.warn(`Message returned by broker (unroutable, waiting for consumer queue): ${event.id}`);
           returned = true;
         }
       };
@@ -132,7 +135,8 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
           this.channel.removeListener('return', returnHandler);
 
           if (err || returned) {
-            this.logger.error(`Failed to publish or broker returned event ${event.id}: ${err?.message}`);
+            const reason = err?.message ?? 'No consumer queue bound to game.finished (mandatory return)';
+            this.logger.error(`Failed to publish event ${event.id}: ${reason}`);
             resolve(false);
           } else {
             this.logger.log(`Confirmed event publication to game.finished: ${event.id}`);

@@ -12,6 +12,28 @@ import { Server, Socket } from 'socket.io';
 import { GameService } from './game.service';
 import { OperationResponse, StateResponse } from '../domain/types';
 
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UCI_MOVE_REGEX = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
+
+function isObject(val: any): boolean {
+  return val !== null && typeof val === 'object' && !Array.isArray(val);
+}
+
+function normalizePayload(data: any): any {
+  if (typeof data === 'function' || data === undefined || data === null || data === '') {
+    return {};
+  }
+  if (typeof data === 'string') {
+    try {
+      return JSON.parse(data);
+    } catch {
+      return data;
+    }
+  }
+  return data;
+}
+
 @WebSocketGateway({
   // The API gateway routes this path here and requires a valid token on it.
   path: '/ws/game',
@@ -50,9 +72,10 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @SubscribeMessage('joinQueue')
   async handleJoinQueue(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: any,
+    @MessageBody() rawData: any,
   ): Promise<OperationResponse> {
-    if (data && typeof data !== 'object') {
+    const data = normalizePayload(rawData);
+    if (!isObject(data)) {
       return {
         ok: false,
         error: { code: 'invalidPayload', message: 'Payload must be an object' },
@@ -65,9 +88,10 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @SubscribeMessage('leaveQueue')
   async handleLeaveQueue(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: any,
+    @MessageBody() rawData: any,
   ): Promise<OperationResponse> {
-    if (data && typeof data !== 'object') {
+    const data = normalizePayload(rawData);
+    if (!isObject(data)) {
       return {
         ok: false,
         error: { code: 'invalidPayload', message: 'Payload must be an object' },
@@ -80,9 +104,10 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @SubscribeMessage('startBotGame')
   async handleStartBotGame(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: any,
+    @MessageBody() rawData: any,
   ): Promise<OperationResponse> {
-    if (data && typeof data !== 'object') {
+    const data = normalizePayload(rawData);
+    if (!isObject(data)) {
       return {
         ok: false,
         error: { code: 'invalidPayload', message: 'Payload must be an object' },
@@ -95,19 +120,21 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @SubscribeMessage('makeMove')
   async handleMakeMove(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: any,
+    @MessageBody() rawData: any,
   ): Promise<OperationResponse> {
+    const data = normalizePayload(rawData);
     if (
-      !data ||
-      typeof data !== 'object' ||
+      !isObject(data) ||
       typeof data.gameId !== 'string' ||
-      typeof data.move !== 'string'
+      !UUID_REGEX.test(data.gameId) ||
+      typeof data.move !== 'string' ||
+      !UCI_MOVE_REGEX.test(data.move)
     ) {
       return {
         ok: false,
         error: {
           code: 'invalidPayload',
-          message: 'gameId and move strings are required.',
+          message: 'Valid gameId (UUID) and move (UCI notation) are required.',
         },
       };
     }
@@ -118,12 +145,13 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @SubscribeMessage('resign')
   async handleResign(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: any,
+    @MessageBody() rawData: any,
   ): Promise<OperationResponse> {
-    if (!data || typeof data !== 'object' || typeof data.gameId !== 'string') {
+    const data = normalizePayload(rawData);
+    if (!isObject(data) || typeof data.gameId !== 'string' || !UUID_REGEX.test(data.gameId)) {
       return {
         ok: false,
-        error: { code: 'invalidPayload', message: 'gameId string is required.' },
+        error: { code: 'invalidPayload', message: 'Valid gameId (UUID) is required.' },
       };
     }
     const { userId } = client.data;
@@ -133,9 +161,10 @@ export class GameGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @SubscribeMessage('getState')
   async handleGetState(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: any,
+    @MessageBody() rawData: any,
   ): Promise<StateResponse | OperationResponse> {
-    if (data && typeof data !== 'object') {
+    const data = normalizePayload(rawData);
+    if (!isObject(data)) {
       return {
         ok: false,
         error: { code: 'invalidPayload', message: 'Payload must be an object' },

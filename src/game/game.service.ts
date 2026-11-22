@@ -5,17 +5,17 @@ import { RedisService } from '../redis/redis.service';
 import { EngineClient } from '../engine/engine.client';
 import { ChessRules } from '../domain/chess-rules';
 import {
+  BotPlayer,
   Color,
-  GameState,
-  GameResult,
+  FinishedGame,
   GameEndReason,
+  GameFinishedEvent,
+  GameResult,
+  GameState,
   OperationResponse,
+  Player,
   StateResponse,
   UserPlayer,
-  BotPlayer,
-  Player,
-  GameFinishedEvent,
-  FinishedGame,
 } from '../domain/types';
 
 const STARTING_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
@@ -36,6 +36,11 @@ export class GameService {
 
   setServer(server: Server) {
     this.server = server;
+  }
+
+  private toPublicGameState(game: ExtendedGameState): GameState {
+    const { lastMoveTimestamp, ...publicGame } = game;
+    return publicGame;
   }
 
   private broadcastToUsers(userIds: string[], event: string, payload: any, gameId?: string) {
@@ -138,7 +143,12 @@ export class GameService {
 
     await this.redisService.createGame(game);
 
-    this.broadcastToUsers([userId], 'gameStarted', { game }, gameId);
+    this.broadcastToUsers(
+      [userId],
+      'gameStarted',
+      { game: this.toPublicGameState(game) },
+      gameId,
+    );
 
     // If bot plays white, its first move arrives as moveMade (AsyncAPI contract)
     if (white.kind === 'bot') {
@@ -177,7 +187,12 @@ export class GameService {
 
     await this.redisService.createGame(game);
 
-    this.broadcastToUsers([p1.userId, p2.userId], 'gameStarted', { game }, gameId);
+    this.broadcastToUsers(
+      [p1.userId, p2.userId],
+      'gameStarted',
+      { game: this.toPublicGameState(game) },
+      gameId,
+    );
   }
 
   /**
@@ -252,6 +267,10 @@ export class GameService {
     game.clock = updatedClock;
     game.lastMoveTimestamp = now;
 
+    if (moveResult.isGameOver) {
+      delete game.clock.running;
+    }
+
     // Broadcast moveMade to both players and spectators
     this.broadcastToUsers(
       playerUserIds,
@@ -267,7 +286,6 @@ export class GameService {
 
     if (moveResult.isGameOver) {
       // Game over by checkmate, stalemate, repetition, 50-move, or insufficient material
-      delete game.clock.running;
       await this.finalizeGame(game, moveResult.result!, moveResult.reason!, game.clock);
     } else {
       await this.redisService.saveGameState(game, false);
@@ -289,11 +307,16 @@ export class GameService {
    * Executes a move chosen by engine-service.
    */
   private async executeBotMoveAsync(game: ExtendedGameState) {
-    const botResponse = await this.engineClient.requestMove(game.fen, game.variant);
+    const botResponse = await this.engineClient.requestMove(
+      game.fen,
+      game.variant,
+    );
 
     if (!botResponse.success || !botResponse.move) {
       // If engine failed both attempts, abort the game with engineFailure (ADR-6, ADR-10)
-      this.logger.error(`Engine failed to provide a move for game ${game.gameId}. Aborting.`);
+      this.logger.error(
+        `Engine failed to provide a move for game ${game.gameId}. Aborting.`,
+      );
       delete game.clock.running;
       await this.finalizeGame(game, 'aborted', 'engineFailure', game.clock);
       return;
@@ -310,13 +333,16 @@ export class GameService {
 
     const now = Date.now();
     const botColor: Color = game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
-    const opponentColor: Color = botColor === 'white' ? 'black' : 'white';
 
     // Update clock: start opponent's clock
-    game.clock.running = opponentColor;
+    game.clock.running = botColor === 'white' ? 'black' : 'white';
     game.moves.push(botMove);
     game.fen = moveResult.fen!;
     game.lastMoveTimestamp = now;
+
+    if (moveResult.isGameOver) {
+      delete game.clock.running;
+    }
 
     const userIds: string[] = [];
     if (game.white.kind === 'user') userIds.push(game.white.userId);
@@ -335,8 +361,12 @@ export class GameService {
     );
 
     if (moveResult.isGameOver) {
-      delete game.clock.running;
-      await this.finalizeGame(game, moveResult.result!, moveResult.reason!, game.clock);
+      await this.finalizeGame(
+        game,
+        moveResult.result!,
+        moveResult.reason!,
+        game.clock,
+      );
     } else {
       await this.redisService.saveGameState(game, false);
     }
@@ -448,9 +478,9 @@ export class GameService {
       return { ok: true, queued: true };
     }
     if (status.status === 'game' && status.gameId) {
-      const game = await this.redisService.getGame(status.gameId);
+      const game = (await this.redisService.getGame(status.gameId)) as ExtendedGameState | null;
       if (game) {
-        return { ok: true, queued: false, game };
+        return { ok: true, queued: false, game: this.toPublicGameState(game) };
       }
     }
     return { ok: true, queued: false };
