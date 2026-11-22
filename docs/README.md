@@ -16,13 +16,17 @@
 - How the payloads of the events are validated against the contract.
 - Where the UUID v7 of a game comes from, for example the `uuid` package or a function of Node.js.
 
+## Implementation status
+
+- ✅ Read user identity from `x-user-id` and `x-user-name` headers during WebSocket handshake (ADR-4).
+- ✅ Contract events on `/ws/game` implemented (`joinQueue`, `leaveQueue`, `startBotGame`, `makeMove`, `resign`, `getState`) with acknowledgments and error codes (`game-service.asyncapi.yaml`).
+- ✅ Matchmaking queue (FIFO) and games in Redis, atomic Lua scripts for queue and updates (ADR-3, ADR-10).
+- ✅ Sakk játékszabályok chess.js alapokon: lépésvalidáció, matt, patt, hármas ismétlés, 50-lépéses szabály, elégtelen anyag (ADR-9, ADR-10).
+- ✅ Sakkóra (10 perc kezdő, nincs inkrementum, bot óra kezelés, FIDE 6.9 döntetlen timeout esetén elégtelen anyaggal) és Redis Sorted Set alapú háttérfigyelő (ADR-10).
+- ✅ Engine-service integráció `POST /moves` hívással, 15s timeouttal és 1 retry-val 500-as hiba esetén, motorkudarc esetén `aborted` / `engineFailure` lezárással (ADR-6, ADR-10).
+- ✅ Tranzakcionális outbox Redisben és megbízható RabbitMQ közzététel a `game.events` topic exchange-re `game.finished` routing key-jel és publisher confirm-mel (ADR-6).
+
 ## Next steps
 
-- Read the user from `x-user-id` and `x-user-name` of the handshake (ADR-4), and read `REDIS_URL`, `RABBITMQ_URL` and `ENGINE_URL` as required settings (ADR-6).
-- Describe in the README how the service runs on the host against Redis and RabbitMQ of the infra compose, with the Redis user `game-service` and the password `GAME_REDIS_PASSWORD` of the infra `.env` in `REDIS_URL`, with `ENGINE_URL` pointing to the engine-service of the infra compose at http://localhost:8000 (ADR-6).
-- Replace the stub events with the events of the contract `game-service.asyncapi.yaml` of the infra repo, with their acknowledgements and error codes, and update the README.
-- Keep the queue, the games and the outbox in Redis, add the Redis adapter of Socket.IO (ADR-3), and send the events of a game to every connection of its players (ADR-10).
-- Check the moves and the end of the game with chess.js (ADR-9), and run the clock of ADR-10.
-- Call the engine-service as the contract `engine-service.openapi.yaml` describes, with the timeout and the repeat of ADR-6, and end the game as aborted if both requests fail (ADR-10). Until the engine-service is ready, the tests use a fake engine (ADR-7).
-- Publish `game.finished.v1` of the contract `game-events.asyncapi.yaml` from the outbox (ADR-6). To see the messages in the management interface of RabbitMQ, bind a test queue there to `game.finished` on `game.events`, because the broker returns the messages that no queue gets.
 - Add the CI workflow of ADR-2.
+- GHCR container image publish.

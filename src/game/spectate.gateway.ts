@@ -1,4 +1,11 @@
-import { WebSocketGateway, OnGatewayConnection, OnGatewayDisconnect } from '@nestjs/websockets';
+import {
+  WebSocketGateway,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+  SubscribeMessage,
+  ConnectedSocket,
+  MessageBody,
+} from '@nestjs/websockets';
 import { Socket } from 'socket.io';
 
 @WebSocketGateway({
@@ -9,11 +16,19 @@ import { Socket } from 'socket.io';
 })
 export class SpectateGateway implements OnGatewayConnection, OnGatewayDisconnect {
   handleConnection(client: Socket) {
-    // TODO: Check the token of the spectator link
-    console.log(`[WebSocket] Spectator connected: ${client.id}`);
+    // Spectator connected
   }
 
   handleDisconnect(client: Socket) {
-    console.log(`[WebSocket] Spectator disconnected: ${client.id}`);
+    // Spectator disconnected
+  }
+
+  @SubscribeMessage('spectateGame')
+  handleSpectateGame(@ConnectedSocket() client: Socket, @MessageBody() data: any) {
+    if (data && typeof data.gameId === 'string') {
+      client.join(`game:${data.gameId}`);
+      return { ok: true };
+    }
+    return { ok: false };
   }
 }
