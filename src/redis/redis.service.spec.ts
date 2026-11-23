@@ -1,7 +1,54 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { RedisService } from './redis.service';
 import { AppConfigService } from '../config/config.service';
-import { GameState, UserPlayer } from '../domain/types';
+import { GameFinishedEvent, GameState, UserPlayer } from '../domain/types';
+
+/** The commands of a pipeline or a transaction, which ioredis chains until exec. */
+function commandChain() {
+  return {
+    set: vi.fn().mockReturnThis(),
+    del: vi.fn().mockReturnThis(),
+    zadd: vi.fn().mockReturnThis(),
+    zrem: vi.fn().mockReturnThis(),
+    lpush: vi.fn().mockReturnThis(),
+    exec: vi.fn().mockResolvedValue([]),
+  };
+}
+
+function newGame(): GameState {
+  return {
+    gameId: 'game-1',
+    variant: 'standard',
+    white: { kind: 'user', userId: 'user-1', name: 'Alice' },
+    black: { kind: 'user', userId: 'user-2', name: 'Bob' },
+    timeControl: { initialMs: 600000 },
+    startedAt: '2026-11-21T00:00:00.000Z',
+    moves: [],
+    fen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+    clock: { whiteMs: 600000, blackMs: 600000, running: 'white' },
+  };
+}
+
+function finishedEvent(game: GameState): GameFinishedEvent {
+  return {
+    id: '0193c2c0-1a2b-7c3d-8e4f-5a6b7c8d9e0f',
+    type: 'game.finished.v1',
+    source: 'game-service',
+    time: '2026-11-21T00:10:00.000Z',
+    data: {
+      gameId: game.gameId,
+      variant: game.variant,
+      white: game.white,
+      black: game.black,
+      result: 'whiteWon',
+      reason: 'resignation',
+      moves: game.moves,
+      timeControl: game.timeControl,
+      startedAt: game.startedAt,
+      endedAt: '2026-11-21T00:10:00.000Z',
+    },
+  };
+}
 
 describe('RedisService', () => {
   let service: RedisService;
@@ -13,17 +60,12 @@ describe('RedisService', () => {
       set: vi.fn(),
       del: vi.fn(),
       eval: vi.fn(),
-      pipeline: vi.fn().mockReturnValue({
-        set: vi.fn().mockReturnThis(),
-        del: vi.fn().mockReturnThis(),
-        zadd: vi.fn().mockReturnThis(),
-        zrem: vi.fn().mockReturnThis(),
-        lpush: vi.fn().mockReturnThis(),
-        exec: vi.fn().mockResolvedValue([]),
-      }),
+      pipeline: vi.fn().mockReturnValue(commandChain()),
+      multi: vi.fn().mockReturnValue(commandChain()),
       zrangebyscore: vi.fn(),
       zrem: vi.fn(),
-      rpop: vi.fn(),
+      lindex: vi.fn(),
+      lrem: vi.fn(),
       lpush: vi.fn(),
     };
 
@@ -109,17 +151,7 @@ describe('RedisService', () => {
   });
 
   it('creates game and sets up pipeline commands', async () => {
-    const game: GameState = {
-      gameId: 'game-1',
-      variant: 'standard',
-      white: { kind: 'user', userId: 'user-1', name: 'Alice' },
-      black: { kind: 'user', userId: 'user-2', name: 'Bob' },
-      timeControl: { initialMs: 600000 },
-      startedAt: '2026-11-21T00:00:00.000Z',
-      moves: [],
-      fen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
-      clock: { whiteMs: 600000, blackMs: 600000, running: 'white' },
-    };
+    const game = newGame();
 
     await service.createGame(game);
     const pipelineMock = mockRedis.pipeline();
@@ -136,5 +168,51 @@ describe('RedisService', () => {
       'game:game-1',
     );
     expect(pipelineMock.zadd).toHaveBeenCalled();
+  });
+
+  it('saves a finished game and its outbox event in one transaction', async () => {
+    const game = newGame();
+    const event = finishedEvent(game);
+
+    await service.saveGameState(game, true, event);
+
+    expect(mockRedis.pipeline).not.toHaveBeenCalled();
+    const transaction = mockRedis.multi();
+    expect(transaction.set).toHaveBeenCalledWith(
+      'game:game-1',
+      JSON.stringify(game),
+    );
+    expect(transaction.del).toHaveBeenCalledWith('user:status:user-1');
+    expect(transaction.del).toHaveBeenCalledWith('user:status:user-2');
+    expect(transaction.lpush).toHaveBeenCalledWith(
+      'outbox:events',
+      JSON.stringify(event),
+    );
+    expect(transaction.exec).toHaveBeenCalled();
+  });
+
+  it('returns the oldest outbox event without removing it', async () => {
+    const event = finishedEvent(newGame());
+    const json = JSON.stringify(event);
+    mockRedis.lindex.mockResolvedValue(json);
+
+    await expect(service.peekOutboxEvent()).resolves.toEqual({ json, event });
+
+    expect(mockRedis.lindex).toHaveBeenCalledWith('outbox:events', -1);
+    expect(mockRedis.lrem).not.toHaveBeenCalled();
+  });
+
+  it('returns null when the outbox is empty', async () => {
+    mockRedis.lindex.mockResolvedValue(null);
+
+    await expect(service.peekOutboxEvent()).resolves.toBeNull();
+  });
+
+  it('removes a confirmed event by its stored JSON', async () => {
+    const json = JSON.stringify(finishedEvent(newGame()));
+
+    await service.removeOutboxEvent(json);
+
+    expect(mockRedis.lrem).toHaveBeenCalledWith('outbox:events', -1, json);
   });
 });

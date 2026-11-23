@@ -14,6 +14,10 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const config = app.get(AppConfigService);
 
+  // A stop signal such as SIGTERM runs onModuleDestroy of every module, which closes the connections to Redis and
+  // RabbitMQ before the process ends.
+  app.enableShutdownHooks();
+
   await app.listen(config.port, config.host);
   console.log(`Game Service is listening on ${config.host}:${config.port}`);
 }
