@@ -265,6 +265,84 @@ describe('GameService', () => {
       expect(res.game?.clock.blackMs).toBe(600000);
     });
 
+    it('subtracts elapsed time from the black running side clock in getState', async () => {
+      const now = Date.now();
+      const activeGame = {
+        gameId: 'g1',
+        variant: 'standard',
+        startedAt: new Date(now - 10000).toISOString(),
+        lastMoveTimestamp: now - 3000,
+        clock: {
+          initialMs: 600000,
+          whiteMs: 580000,
+          blackMs: 590000,
+          running: 'black',
+        },
+      } as any;
+      mockRedis.getUserStatus.mockResolvedValue({
+        status: 'game',
+        gameId: 'g1',
+      });
+      mockRedis.getGame.mockResolvedValue(activeGame);
+
+      const res = await service.getState('user-1');
+      expect(res.ok).toBe(true);
+      expect(res.game?.clock.running).toBe('black');
+      expect(res.game?.clock.whiteMs).toBe(580000);
+      expect(res.game?.clock.blackMs).toBeLessThanOrEqual(587000);
+      expect(res.game?.clock.blackMs).toBeGreaterThan(580000);
+    });
+
+    it('clamps remaining clock to 0 when elapsed time exceeds clock in getState', async () => {
+      const now = Date.now();
+      const activeGame = {
+        gameId: 'g1',
+        variant: 'standard',
+        startedAt: new Date(now - 20000).toISOString(),
+        lastMoveTimestamp: now - 15000,
+        clock: {
+          initialMs: 600000,
+          whiteMs: 5000, // 5s left, but 15s elapsed
+          blackMs: 600000,
+          running: 'white',
+        },
+      } as any;
+      mockRedis.getUserStatus.mockResolvedValue({
+        status: 'game',
+        gameId: 'g1',
+      });
+      mockRedis.getGame.mockResolvedValue(activeGame);
+
+      const res = await service.getState('user-1');
+      expect(res.ok).toBe(true);
+      expect(res.game?.clock.whiteMs).toBe(0);
+    });
+
+    it('falls back to startedAt when lastMoveTimestamp is undefined', async () => {
+      const now = Date.now();
+      const activeGame = {
+        gameId: 'g1',
+        variant: 'standard',
+        startedAt: new Date(now - 4000).toISOString(),
+        clock: {
+          initialMs: 600000,
+          whiteMs: 600000,
+          blackMs: 600000,
+          running: 'white',
+        },
+      } as any;
+      mockRedis.getUserStatus.mockResolvedValue({
+        status: 'game',
+        gameId: 'g1',
+      });
+      mockRedis.getGame.mockResolvedValue(activeGame);
+
+      const res = await service.getState('user-1');
+      expect(res.ok).toBe(true);
+      expect(res.game?.clock.whiteMs).toBeLessThanOrEqual(596000);
+      expect(res.game?.clock.whiteMs).toBeGreaterThan(590000);
+    });
+
     it('does not deduct time when clock is not running', async () => {
       const now = Date.now();
       const activeGame = {

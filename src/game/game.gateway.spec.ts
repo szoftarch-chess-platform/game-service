@@ -133,6 +133,27 @@ describe('GameGateway', () => {
       await gateway.handleDisconnect(mockSocket);
       expect(mockGameService.leaveQueue).not.toHaveBeenCalled();
     });
+
+    it('handles errors during disconnect cleanup gracefully without throwing', async () => {
+      const mockServer = {
+        in: vi.fn().mockReturnValue({
+          fetchSockets: vi
+            .fn()
+            .mockRejectedValue(new Error('Redis connection lost')),
+        }),
+      };
+      gateway.server = mockServer as any;
+
+      await expect(gateway.handleDisconnect(mockSocket)).resolves.not.toThrow();
+    });
+
+    it('ignores disconnect when userId is missing', async () => {
+      const noUserSocket = { data: {}, handshake: { headers: {} } } as any;
+      await expect(
+        gateway.handleDisconnect(noUserSocket),
+      ).resolves.not.toThrow();
+      expect(mockGameService.leaveQueue).not.toHaveBeenCalled();
+    });
   });
 
   describe('Payload validation', () => {

@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import {
   WebSocketGateway,
   WebSocketServer,
@@ -51,6 +52,8 @@ export class GameGateway
   @WebSocketServer()
   server!: Server;
 
+  private readonly logger = new Logger(GameGateway.name);
+
   constructor(private readonly gameService: GameService) {}
 
   afterInit(server: Server) {
@@ -94,11 +97,17 @@ export class GameGateway
       return;
     }
 
-    const remainingSockets = await this.server
-      .in(`user:${userId}`)
-      .fetchSockets();
-    if (remainingSockets.length === 0) {
-      await this.gameService.leaveQueue(userId);
+    try {
+      const remainingSockets = await this.server
+        .in(`user:${userId}`)
+        .fetchSockets();
+      if (remainingSockets.length === 0) {
+        await this.gameService.leaveQueue(userId);
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Failed to process disconnect queue cleanup for user ${userId}: ${err}`,
+      );
     }
   }
 
