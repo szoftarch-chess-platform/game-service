@@ -12,7 +12,6 @@
 
 - The Redis client, and the data model of the queue, the games and the outbox with the atomic updates that ADR-3 requires.
 - How a clock that runs out ends its game on any instance without an incoming event (ADR-10), for example with the deadlines in a sorted set of Redis.
-- The RabbitMQ client, and how the outbox is sent on with publisher confirms and the mandatory flag (ADR-6).
 - How the payloads of the events are validated against the contract.
 - Where the UUID v7 of a game comes from, for example the `uuid` package or a function of Node.js.
 

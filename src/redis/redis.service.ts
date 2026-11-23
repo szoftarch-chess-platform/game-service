@@ -8,6 +8,15 @@ export interface UserStatus {
   gameId?: string;
 }
 
+/** An event of the outbox with the JSON that it is stored as, which removing it needs. */
+export interface OutboxEntry {
+  json: string;
+  event: GameFinishedEvent;
+}
+
+// The list of the outbox. New events go to its head, so the oldest one is at its tail.
+const OUTBOX_KEY = 'outbox:events';
+
 @Injectable()
 export class RedisService implements OnModuleInit, OnModuleDestroy {
   private client!: Redis;
@@ -174,18 +183,20 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   /**
    * Updates game state after a move or state change.
    * If finished, clears user statuses, cleans up clock deadlines, and writes to outbox in the same transaction (ADR-6).
+   * Redis runs the commands of MULTI and EXEC together, so a lost connection or a restart of Redis cannot leave a
+   * finished game without its event, as a pipeline could.
    */
   async saveGameState(
     game: GameState,
     isFinished: boolean,
     outboxEvent?: GameFinishedEvent,
   ): Promise<void> {
-    const pipeline = this.client.pipeline();
+    const transaction = this.client.multi();
 
-    pipeline.set(`game:${game.gameId}`, JSON.stringify(game));
+    transaction.set(`game:${game.gameId}`, JSON.stringify(game));
 
     // Clear any existing deadlines for this game
-    pipeline.zrem(
+    transaction.zrem(
       'game:deadlines',
       `${game.gameId}:white`,
       `${game.gameId}:black`,
@@ -193,30 +204,28 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
 
     if (isFinished) {
       if (game.white.kind === 'user') {
-        pipeline.del(`user:status:${game.white.userId}`);
+        transaction.del(`user:status:${game.white.userId}`);
       }
       if (game.black.kind === 'user') {
-        pipeline.del(`user:status:${game.black.userId}`);
+        transaction.del(`user:status:${game.black.userId}`);
       }
       if (outboxEvent) {
-        pipeline.lpush('outbox:events', JSON.stringify(outboxEvent));
+        transaction.lpush(OUTBOX_KEY, JSON.stringify(outboxEvent));
       }
-    } else {
-      if (game.clock.running) {
-        const remainingMs =
-          game.clock.running === 'white'
-            ? (game.clock.whiteMs ?? 600000)
-            : (game.clock.blackMs ?? 600000);
-        const deadline = Date.now() + remainingMs;
-        pipeline.zadd(
-          'game:deadlines',
-          deadline,
-          `${game.gameId}:${game.clock.running}`,
-        );
-      }
+    } else if (game.clock.running) {
+      const remainingMs =
+        game.clock.running === 'white'
+          ? (game.clock.whiteMs ?? 600000)
+          : (game.clock.blackMs ?? 600000);
+      const deadline = Date.now() + remainingMs;
+      transaction.zadd(
+        'game:deadlines',
+        deadline,
+        `${game.gameId}:${game.clock.running}`,
+      );
     }
 
-    await pipeline.exec();
+    await transaction.exec();
   }
 
   /**
@@ -234,18 +243,20 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Pops an event from the outbox list (FIFO: RPOP).
+   * Returns the oldest event of the outbox without removing it. It stays in the outbox until the broker has confirmed
+   * it, so a crash or a refused publish does not lose it (ADR-6).
    */
-  async popOutboxEvent(): Promise<GameFinishedEvent | null> {
-    const data = await this.client.rpop('outbox:events');
-    if (!data) return null;
-    return JSON.parse(data) as GameFinishedEvent;
+  async peekOutboxEvent(): Promise<OutboxEntry | null> {
+    const json = await this.client.lindex(OUTBOX_KEY, -1);
+    if (!json) return null;
+    return { json, event: JSON.parse(json) as GameFinishedEvent };
   }
 
   /**
-   * Requeues an event back to the outbox (RPUSH) if publishing failed, maintaining FIFO order.
+   * Removes an event that the broker has confirmed. LREM looks for its stored JSON from the tail instead of popping the
+   * tail, so it never removes another event, even when another instance has removed this one already.
    */
-  async requeueOutboxEvent(event: GameFinishedEvent): Promise<void> {
-    await this.client.rpush('outbox:events', JSON.stringify(event));
+  async removeOutboxEvent(json: string): Promise<void> {
+    await this.client.lrem(OUTBOX_KEY, -1, json);
   }
 }

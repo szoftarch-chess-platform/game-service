@@ -9,12 +9,22 @@ import { AppConfigService } from '../config/config.service';
 import { RedisService } from '../redis/redis.service';
 import { GameFinishedEvent } from '../domain/types';
 
+// The exchange and the routing key of the finished games (ADR-6).
+const EXCHANGE = 'game.events';
+const ROUTING_KEY = 'game.finished';
+
+// How often the outbox is drained, and how long the publisher waits before it tries the broker again.
+const DRAIN_INTERVAL_MS = 1500;
+export const RETRY_DELAY_MS = 5000;
+
 @Injectable()
 export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OutboxPublisher.name);
-  private connection: any = null;
-  private channel: any = null;
+  private connection: amqp.ChannelModel | null = null;
+  private channel: amqp.ConfirmChannel | null = null;
   private drainInterval: NodeJS.Timeout | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private stopping = false;
   private isDraining = false;
   private nextDrainTime = 0;
 
@@ -30,60 +40,112 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
       this.drainOutbox().catch((err) => {
         this.logger.error(`Error draining outbox: ${err.message}`);
       });
-    }, 1500);
+    }, DRAIN_INTERVAL_MS);
   }
 
+  /**
+   * Stops the drain and closes the connection without connecting again. An event whose confirm has not arrived yet
+   * stays in the outbox, and the next start publishes it.
+   */
   async onModuleDestroy() {
+    this.stopping = true;
     if (this.drainInterval) {
       clearInterval(this.drainInterval);
     }
-    try {
-      if (this.channel) await this.channel.close();
-      if (this.connection) await this.connection.close();
-    } catch {}
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+    }
+
+    // Closing the connection closes its channel too.
+    await this.connection?.close().catch(() => {});
   }
 
-  async connect(): Promise<boolean> {
+  /**
+   * Connects, opens a confirm channel and declares the exchange. If a step fails, it closes the connection that it has
+   * opened, so none is left behind, and it tries again after the delay.
+   */
+  private async connect(): Promise<void> {
+    let connection: amqp.ChannelModel | undefined;
     try {
-      const conn = await amqp.connect(this.config.rabbitmqUrl);
-      conn.on('error', (err) => {
+      connection = await amqp.connect(this.config.rabbitmqUrl);
+      // An error event without a listener would end the process.
+      connection.on('error', (err) => {
         this.logger.warn(`RabbitMQ connection error: ${err.message}`);
       });
-      conn.on('close', () => {
-        this.logger.warn('RabbitMQ connection closed, scheduling reconnect...');
-        this.connection = null;
-        this.channel = null;
-        setTimeout(() => this.connect(), 5000);
-      });
 
-      const confirmChannel = await conn.createConfirmChannel();
-      confirmChannel.on('error', (err) => {
+      const channel = await connection.createConfirmChannel();
+      channel.on('error', (err) => {
         this.logger.warn(`RabbitMQ channel error: ${err.message}`);
       });
 
       // Declare durable topic exchange game.events (ADR-6)
-      await confirmChannel.assertExchange('game.events', 'topic', {
+      await channel.assertExchange(EXCHANGE, 'topic', {
         durable: true,
         autoDelete: false,
       });
 
-      this.connection = conn;
-      this.channel = confirmChannel;
+      if (this.stopping) {
+        // The service stopped while it was connecting.
+        await connection.close().catch(() => {});
+        return;
+      }
+
+      this.watch(connection, channel);
+      this.connection = connection;
+      this.channel = channel;
       this.logger.log(
-        'Connected to RabbitMQ and declared exchange game.events',
+        `Connected to RabbitMQ and declared exchange ${EXCHANGE}`,
       );
-      return true;
     } catch (err: any) {
       this.logger.warn(
-        `Failed to connect to RabbitMQ: ${err.message}. Retrying in 5s...`,
+        `Failed to connect to RabbitMQ: ${err.message}. Retrying in ${RETRY_DELAY_MS / 1000} s.`,
       );
-      setTimeout(() => this.connect(), 5000);
-      return false;
+      await connection?.close().catch(() => {});
+      this.scheduleReconnect();
     }
   }
 
+  /** Connects again after the connection or the channel closes. */
+  private watch(connection: amqp.ChannelModel, channel: amqp.ConfirmChannel) {
+    channel.once('close', () => {
+      // The broker closes a channel after an error, such as a deleted exchange, while the connection stays open, and
+      // a closed channel cannot be used again, so the connection is closed too. A closing connection closes its
+      // channels first, so the check waits until the close of the connection has been handled.
+      queueMicrotask(() => {
+        if (this.connection === connection && !this.stopping) {
+          connection.close().catch(() => {});
+        }
+      });
+    });
+
+    connection.once('close', () => {
+      this.connection = null;
+      this.channel = null;
+      if (!this.stopping) {
+        this.logger.warn(
+          `RabbitMQ connection closed. Connecting again in ${RETRY_DELAY_MS / 1000} s.`,
+        );
+        this.scheduleReconnect();
+      }
+    });
+  }
+
+  /** Connects again after the delay, unless a new connection is due already or the service stops. */
+  private scheduleReconnect() {
+    if (this.stopping || this.reconnectTimer) {
+      return;
+    }
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect();
+    }, RETRY_DELAY_MS);
+  }
+
   /**
-   * Drains events from the Redis outbox list and publishes them with publisher confirms.
+   * Publishes the events of the outbox from the oldest one with publisher confirms. An event leaves the outbox only
+   * after the broker has confirmed it, so a crash or a refused event loses nothing (ADR-6). A crash between the
+   * confirm and the removal publishes the event again, and the consumer filters out the repeated one.
    */
   async drainOutbox() {
     if (this.isDraining || !this.channel || Date.now() < this.nextDrainTime)
@@ -91,43 +153,55 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
     this.isDraining = true;
 
     try {
-      let event: GameFinishedEvent | null = null;
-      while ((event = await this.redisService.popOutboxEvent())) {
-        const published = await this.publishEvent(event);
-        if (!published) {
-          // Requeue back into Redis outbox if broker did not accept or confirm
-          await this.redisService.requeueOutboxEvent(event);
-          // Wait 5 seconds before retrying to prevent rapid log flooding
-          this.nextDrainTime = Date.now() + 5000;
-          break;
-        }
-      }
+      await this.publishOldestEvents();
     } finally {
       this.isDraining = false;
     }
   }
 
+  /** Publishes the oldest event and then the next ones, until the outbox is empty or the broker refuses one. */
+  private async publishOldestEvents(): Promise<void> {
+    const entry = await this.redisService.peekOutboxEvent();
+    if (!entry) {
+      return;
+    }
+
+    if (!(await this.publishEvent(entry.event))) {
+      // The event stays in the outbox, and the next drain tries it again after the delay.
+      this.nextDrainTime = Date.now() + RETRY_DELAY_MS;
+      return;
+    }
+
+    await this.redisService.removeOutboxEvent(entry.json);
+    return this.publishOldestEvents();
+  }
+
   /**
-   * Publishes a single event with mandatory flag, persistent delivery, and publisher confirm.
+   * Publishes a single event with mandatory flag, persistent delivery, and publisher confirm. It returns true only
+   * when the broker has confirmed the event without returning it.
    */
   async publishEvent(event: GameFinishedEvent): Promise<boolean> {
-    if (!this.channel) {
+    // The connection may close while the event waits for its confirm, which empties this.channel.
+    const channel = this.channel;
+    if (!channel) {
       return false;
     }
 
     return new Promise<boolean>((resolve) => {
       let returned = false;
 
-      const returnHandler = (msg: amqp.ConsumeMessage) => {
+      // The broker returns an unroutable event before it confirms it. The handler stays until the confirm, so the
+      // return of another event cannot use it up.
+      const returnHandler = (msg: amqp.Message) => {
         if (msg.properties.messageId === event.id) {
           this.logger.warn(
-            `Message returned by broker (unroutable, waiting for consumer queue): ${event.id}`,
+            `The broker returned the event ${event.id}, because no queue is bound to ${ROUTING_KEY} yet.`,
           );
           returned = true;
         }
       };
 
-      this.channel.once('return', returnHandler);
+      channel.on('return', returnHandler);
 
       const buffer = Buffer.from(JSON.stringify(event));
       const options: amqp.Options.Publish = {
@@ -138,28 +212,27 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
         type: event.type,
       };
 
-      this.channel.publish(
-        'game.events',
-        'game.finished',
-        buffer,
-        options,
-        (err: any) => {
-          this.channel.removeListener('return', returnHandler);
+      const onConfirm = (err: any) => {
+        channel.removeListener('return', returnHandler);
 
-          if (err || returned) {
-            const reason =
-              err?.message ??
-              'No consumer queue bound to game.finished (mandatory return)';
-            this.logger.error(`Failed to publish event ${event.id}: ${reason}`);
-            resolve(false);
-          } else {
-            this.logger.log(
-              `Confirmed event publication to game.finished: ${event.id}`,
-            );
-            resolve(true);
-          }
-        },
-      );
+        if (err || returned) {
+          const reason = err?.message ?? `no queue is bound to ${ROUTING_KEY}`;
+          this.logger.error(`Failed to publish event ${event.id}: ${reason}`);
+          resolve(false);
+        } else {
+          this.logger.log(
+            `Confirmed event publication to ${ROUTING_KEY}: ${event.id}`,
+          );
+          resolve(true);
+        }
+      };
+
+      try {
+        channel.publish(EXCHANGE, ROUTING_KEY, buffer, options, onConfirm);
+      } catch (err) {
+        // A closed channel throws at once and never calls back.
+        onConfirm(err);
+      }
     });
   }
 }
