@@ -7,6 +7,7 @@
 | ID | Title |
 |---|---|
 | [GS-ADR-1](adr/container-image.md) | Multi-stage container image |
+| [GS-ADR-2](adr/configuration.md) | Settings with @nestjs/config |
 
 ## Open questions
 
