@@ -1,9 +1,10 @@
 import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { Environment } from './environment';
 
 /**
- * The settings of the service from its environment variables. Every setting is required, so the service reads and
- * checks them all once at startup, and a missing or invalid one stops it with an error that names the variable, as
- * the conventions of the infra repo require. The errors never contain a value, because the URLs hold passwords.
+ * The checked settings of the service with their types. ConfigModule checks them once at startup with
+ * validateEnvironment, and the other modules read them here instead of by the names of the environment variables.
  */
 @Injectable()
 export class AppConfigService {
@@ -13,47 +14,11 @@ export class AppConfigService {
   readonly rabbitmqUrl: string;
   readonly engineUrl: string;
 
-  constructor() {
-    this.port = readPort('PORT');
-    // The address to listen on, 0.0.0.0 in a container and 127.0.0.1 on the host.
-    this.host = readRequired('HOST');
-    this.redisUrl = readUrl('REDIS_URL', ['redis:', 'rediss:']);
-    this.rabbitmqUrl = readUrl('RABBITMQ_URL', ['amqp:', 'amqps:']);
-    this.engineUrl = readUrl('ENGINE_URL', ['http:', 'https:']);
+  constructor(config: ConfigService<Environment, true>) {
+    this.port = config.get('PORT', { infer: true });
+    this.host = config.get('HOST', { infer: true });
+    this.redisUrl = config.get('REDIS_URL', { infer: true });
+    this.rabbitmqUrl = config.get('RABBITMQ_URL', { infer: true });
+    this.engineUrl = config.get('ENGINE_URL', { infer: true });
   }
-}
-
-function readRequired(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`The ${name} environment variable is required.`);
-  }
-
-  return value;
-}
-
-// Only decimal digits, because Number() would also accept values such as 1e3, 0x0bb9 or 3001.0.
-function readPort(name: string): number {
-  const value = readRequired(name);
-  const port = Number(value);
-  if (!/^\d+$/.test(value) || port < 1 || port > 65535) {
-    throw new Error(
-      `The ${name} environment variable must be a port number from 1 to 65535.`,
-    );
-  }
-
-  return port;
-}
-
-function readUrl(name: string, protocols: string[]): string {
-  const value = readRequired(name);
-  const url = URL.parse(value);
-  if (!url || !protocols.includes(url.protocol)) {
-    const schemes = protocols.map((protocol) => `${protocol}//`).join(' or ');
-    throw new Error(
-      `The ${name} environment variable must be a URL that starts with ${schemes}.`,
-    );
-  }
-
-  return value;
 }

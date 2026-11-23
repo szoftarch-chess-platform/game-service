@@ -20,7 +20,7 @@ game-service/
 │       ├── game.gateway.ts       # WebSocket (Socket.IO) gateway stub with TODO comments
 │       └── spectate.gateway.ts   # WebSocket (Socket.IO) gateway stub of the spectators
 ├── docs/                         # Decisions, open questions and next steps
-├── .env.example                  # Environment variables template
+├── .env.example                  # Template of the settings on the host, which the infra setup script fills
 ├── .npmrc                        # npm settings
 ├── Dockerfile                    # Container image
 ├── .dockerignore                 # Files left out of the image build
@@ -32,7 +32,7 @@ game-service/
 
 ## ⚙️ Environment Configuration
 
-Define the variables in `.env` or in the container environment. Every variable is required, and the service stops at startup with an error that names a missing or invalid one.
+The service reads the variables with `@nestjs/config`, as [GS-ADR-2](docs/adr/configuration.md) decides. A variable of the environment wins over `.env.local`, which wins over `.env`, and both files are optional. In a container compose sets every variable. Every variable is required, and the service stops at startup with an error that names a missing or invalid one.
 
 | Variable | Description |
 |---|---|
@@ -42,7 +42,7 @@ Define the variables in `.env` or in the container environment. Every variable i
 | `RABBITMQ_URL` | URI of RabbitMQ with the user `game-service`, starting with `amqp://` or `amqps://` and ending in `/%2f` for the default virtual host |
 | `ENGINE_URL` | address of the engine-service, starting with `http://` or `https://` |
 
-The template [`.env.example`](.env.example) has the values for a service on the host next to the infra compose. The passwords come from the `.env` of the infra repo.
+On the host `scripts/dev-setup.mjs` of the infra repo writes `.env` from the template [`.env.example`](.env.example) with the passwords of the `.env` of the infra repo. It writes the file again at every run, so values of your own go into `.env.local`.
 
 ---
 
@@ -75,9 +75,9 @@ npm install
 ```
 
 ### 2. Configure Environment
-Create `.env` from the template and fill it in as described under Environment Configuration:
+Run the setup script of the infra repo, which writes `.env` as described under Environment Configuration. Run it again after a pull that changes `.env.example`.
 ```bash
-cp .env.example .env
+node ../infra/scripts/dev-setup.mjs
 ```
 
 ### 3. Run Tests (Vitest)
@@ -89,10 +89,10 @@ npm test
 ```bash
 npm run start:dev
 ```
-The application will listen on the address and the port specified in `.env`.
+The application will listen on the address and the port of the settings.
 
 ### 5. Run Behind the Gateway
-Keep `PORT=3001`, the port of the container, and add `compose.game-on-host.yaml` to the compose files as the README of the infra repo describes for a service on the host. The gateway at https://localhost:8443 then sends `/ws/game` and `/ws/spectate` to this process. On Linux set `HOST` to the address of the Docker bridge that the README of the infra repo describes.
+Keep `PORT=3001`, the port of the container, and add `compose.game-on-host.yaml` to the compose files as the README of the infra repo describes for a service on the host. The gateway at https://localhost:8443 then sends `/ws/game` and `/ws/spectate` to this process. On Linux set `HOST` in `.env.local` to the address of the Docker bridge that the README of the infra repo describes.
 
 ---
 
