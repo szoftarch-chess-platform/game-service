@@ -37,6 +37,56 @@ describe('GameGateway', () => {
     };
   });
 
+  describe('afterInit & auth middleware', () => {
+    it('registers Socket.IO middleware that validates headers and sets socket data', () => {
+      let middleware: any;
+      const mockServer = {
+        use: vi.fn((fn) => {
+          middleware = fn;
+        }),
+      };
+      gateway.afterInit(mockServer as any);
+      expect(mockServer.use).toHaveBeenCalled();
+      expect(mockGameService.setServer).toHaveBeenCalledWith(mockServer);
+
+      const next = vi.fn();
+      const testSocket = {
+        handshake: {
+          headers: {
+            'x-user-id': '0193c2b4-7d3e-7c2a-9f1e-3b5a6c7d8e9f',
+            'x-user-name': 'alice',
+          },
+        },
+        data: {},
+      };
+      middleware(testSocket, next);
+      expect(next).toHaveBeenCalledWith();
+      expect(testSocket.data).toEqual({
+        userId: '0193c2b4-7d3e-7c2a-9f1e-3b5a6c7d8e9f',
+        userName: 'alice',
+      });
+    });
+
+    it('rejects handshake with unauthorized error when identity headers are missing', () => {
+      let middleware: any;
+      const mockServer = {
+        use: vi.fn((fn) => {
+          middleware = fn;
+        }),
+      };
+      gateway.afterInit(mockServer as any);
+
+      const next = vi.fn();
+      const unauthSocket = {
+        handshake: { headers: {} },
+        data: {},
+      };
+      middleware(unauthSocket, next);
+      expect(next).toHaveBeenCalledWith(expect.any(Error));
+      expect(next.mock.calls[0][0].message).toBe('unauthorized');
+    });
+  });
+
   describe('handleConnection', () => {
     it('authenticates and joins user room when identity headers are present', () => {
       gateway.handleConnection(mockSocket);
@@ -48,8 +98,40 @@ describe('GameGateway', () => {
 
     it('disconnects socket if identity headers are missing', () => {
       mockSocket.handshake.headers = {};
+      mockSocket.data = {};
       gateway.handleConnection(mockSocket);
       expect(mockSocket.disconnect).toHaveBeenCalledWith(true);
+    });
+  });
+
+  describe('handleDisconnect', () => {
+    it('removes user from queue when no remaining connections exist', async () => {
+      const mockServer = {
+        in: vi.fn().mockReturnValue({
+          fetchSockets: vi.fn().mockResolvedValue([]),
+        }),
+      };
+      gateway.server = mockServer as any;
+
+      await gateway.handleDisconnect(mockSocket);
+      expect(mockServer.in).toHaveBeenCalledWith(
+        'user:0193c2b4-7d3e-7c2a-9f1e-3b5a6c7d8e9f',
+      );
+      expect(mockGameService.leaveQueue).toHaveBeenCalledWith(
+        '0193c2b4-7d3e-7c2a-9f1e-3b5a6c7d8e9f',
+      );
+    });
+
+    it('does not remove user from queue if other connections remain in user room', async () => {
+      const mockServer = {
+        in: vi.fn().mockReturnValue({
+          fetchSockets: vi.fn().mockResolvedValue([{ id: 'other-socket' }]),
+        }),
+      };
+      gateway.server = mockServer as any;
+
+      await gateway.handleDisconnect(mockSocket);
+      expect(mockGameService.leaveQueue).not.toHaveBeenCalled();
     });
   });
 

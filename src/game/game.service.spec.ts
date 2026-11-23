@@ -236,6 +236,60 @@ describe('GameService', () => {
       expect(res.game).toEqual(activeGame);
     });
 
+    it('subtracts elapsed time from the running side clock in getState', async () => {
+      const now = Date.now();
+      const activeGame = {
+        gameId: 'g1',
+        variant: 'standard',
+        startedAt: new Date(now - 10000).toISOString(),
+        lastMoveTimestamp: now - 5000,
+        clock: {
+          initialMs: 600000,
+          whiteMs: 600000,
+          blackMs: 600000,
+          running: 'white',
+        },
+      } as any;
+      mockRedis.getUserStatus.mockResolvedValue({
+        status: 'game',
+        gameId: 'g1',
+      });
+      mockRedis.getGame.mockResolvedValue(activeGame);
+
+      const res = await service.getState('user-1');
+      expect(res.ok).toBe(true);
+      expect(res.queued).toBe(false);
+      expect(res.game?.clock.running).toBe('white');
+      expect(res.game?.clock.whiteMs).toBeLessThanOrEqual(595000);
+      expect(res.game?.clock.whiteMs).toBeGreaterThan(590000);
+      expect(res.game?.clock.blackMs).toBe(600000);
+    });
+
+    it('does not deduct time when clock is not running', async () => {
+      const now = Date.now();
+      const activeGame = {
+        gameId: 'g1',
+        variant: 'standard',
+        startedAt: new Date(now - 10000).toISOString(),
+        lastMoveTimestamp: now - 5000,
+        clock: {
+          initialMs: 600000,
+          whiteMs: 500000,
+          blackMs: 500000,
+        },
+      } as any;
+      mockRedis.getUserStatus.mockResolvedValue({
+        status: 'game',
+        gameId: 'g1',
+      });
+      mockRedis.getGame.mockResolvedValue(activeGame);
+
+      const res = await service.getState('user-1');
+      expect(res.ok).toBe(true);
+      expect(res.game?.clock.whiteMs).toBe(500000);
+      expect(res.game?.clock.blackMs).toBe(500000);
+    });
+
     it('returns queued: false when idle', async () => {
       mockRedis.getUserStatus.mockResolvedValue({ status: 'idle' });
       const res = await service.getState('user-1');
