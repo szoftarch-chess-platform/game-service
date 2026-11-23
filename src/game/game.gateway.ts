@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import {
   WebSocketGateway,
   WebSocketServer,
@@ -51,29 +52,63 @@ export class GameGateway
   @WebSocketServer()
   server!: Server;
 
+  private readonly logger = new Logger(GameGateway.name);
+
   constructor(private readonly gameService: GameService) {}
 
   afterInit(server: Server) {
+    server.use((socket, next) => {
+      const headers = socket.handshake.headers;
+      const userId = headers['x-user-id'] as string | undefined;
+      const userName = headers['x-user-name'] as string | undefined;
+
+      if (!userId || !userName) {
+        return next(new Error('unauthorized'));
+      }
+
+      socket.data = { ...socket.data, userId, userName };
+      next();
+    });
+
     this.gameService.setServer(server);
   }
 
   handleConnection(client: Socket) {
-    const headers = client.handshake.headers;
-    const userId = headers['x-user-id'] as string | undefined;
-    const userName = headers['x-user-name'] as string | undefined;
+    const userId =
+      (client.data?.userId as string | undefined) ??
+      (client.handshake.headers['x-user-id'] as string | undefined);
+    const userName =
+      (client.data?.userName as string | undefined) ??
+      (client.handshake.headers['x-user-name'] as string | undefined);
 
     if (!userId || !userName) {
-      // Disconnect if identity headers from Envoy gateway are missing
+      // Fallback disconnect if bypassed middleware
       client.disconnect(true);
       return;
     }
 
-    client.data = { userId, userName };
+    client.data = { ...client.data, userId, userName };
     client.join(`user:${userId}`);
   }
 
-  handleDisconnect(client: Socket) {
-    // Disconnection is stateless according to ADR-10
+  async handleDisconnect(client: Socket) {
+    const userId = client.data?.userId as string | undefined;
+    if (!userId || !this.server) {
+      return;
+    }
+
+    try {
+      const remainingSockets = await this.server
+        .in(`user:${userId}`)
+        .fetchSockets();
+      if (remainingSockets.length === 0) {
+        await this.gameService.leaveQueue(userId);
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Failed to process disconnect queue cleanup for user ${userId}: ${err}`,
+      );
+    }
   }
 
   @SubscribeMessage('joinQueue')

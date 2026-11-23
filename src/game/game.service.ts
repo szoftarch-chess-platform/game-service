@@ -38,8 +38,27 @@ export class GameService {
     this.server = server;
   }
 
-  private toPublicGameState(game: ExtendedGameState): GameState {
+  private toPublicGameState(
+    game: ExtendedGameState,
+    now: number = Date.now(),
+  ): GameState {
     const { lastMoveTimestamp, ...publicGame } = game;
+    if (publicGame.clock?.running) {
+      const runningSide = publicGame.clock.running;
+      const lastTimestamp =
+        lastMoveTimestamp ?? new Date(publicGame.startedAt).getTime();
+      const elapsedMs = Math.max(0, now - lastTimestamp);
+      const clockCopy = { ...publicGame.clock };
+      if (runningSide === 'white' && clockCopy.whiteMs !== undefined) {
+        clockCopy.whiteMs = Math.max(0, clockCopy.whiteMs - elapsedMs);
+      } else if (runningSide === 'black' && clockCopy.blackMs !== undefined) {
+        clockCopy.blackMs = Math.max(0, clockCopy.blackMs - elapsedMs);
+      }
+      return {
+        ...publicGame,
+        clock: clockCopy,
+      };
+    }
     return publicGame;
   }
 
