@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import { AppConfigService } from './config/config.service';
 
 try {
   process.loadEnvFile();
@@ -8,21 +9,13 @@ try {
 }
 
 async function bootstrap() {
-  const port = process.env.PORT;
-  if (!port) {
-    throw new Error('PORT environment variable is required');
-  }
-
-  // The address to listen on, 0.0.0.0 in a container and 127.0.0.1 on the host.
-  const host = process.env.HOST;
-  if (!host) {
-    throw new Error('HOST environment variable is required');
-  }
-
+  // AppConfigService checks every setting when the application is created, so a missing or invalid one stops the
+  // service here. Nest logs the error and exits with the code 1.
   const app = await NestFactory.create(AppModule);
+  const config = app.get(AppConfigService);
 
-  await app.listen(port, host);
-  console.log(`Game Service is listening on ${host}:${port}`);
+  await app.listen(config.port, config.host);
+  console.log(`Game Service is listening on ${config.host}:${config.port}`);
 }
 
 bootstrap().catch((error: unknown) => {

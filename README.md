@@ -32,20 +32,17 @@ game-service/
 
 ## ⚙️ Environment Configuration
 
-Define the required variables in `.env` or in the container environment:
-
-```ini
-# .env
-PORT=3001
-HOST=127.0.0.1
-```
+Define the variables in `.env` or in the container environment. Every variable is required, and the service stops at startup with an error that names a missing or invalid one.
 
 | Variable | Description |
 |---|---|
 | `PORT` | port that the service listens on |
 | `HOST` | address that the service listens on, `127.0.0.1` on the host and `0.0.0.0` in a container |
+| `REDIS_URL` | URL of Redis with the user `game-service`, starting with `redis://` or `rediss://` |
+| `RABBITMQ_URL` | URI of RabbitMQ with the user `game-service`, starting with `amqp://` or `amqps://` and ending in `/%2f` for the default virtual host |
+| `ENGINE_URL` | address of the engine-service, starting with `http://` or `https://` |
 
-A template file [`.env.example`](.env.example) is provided in the repository with empty values for all required keys.
+The template [`.env.example`](.env.example) has the values for a service on the host next to the infra compose. The passwords come from the `.env` of the infra repo.
 
 ---
 
@@ -103,7 +100,7 @@ Keep `PORT=3001`, the port of the container, and add `compose.game-on-host.yaml`
 
 ```bash
 docker build -t game-service .
-docker run --rm --init -e PORT=3001 -e HOST=0.0.0.0 -p 127.0.0.1:3001:3001 game-service
+docker run --rm --init -e PORT=3001 -e HOST=0.0.0.0 -e REDIS_URL=<REDIS_URL> -e RABBITMQ_URL=<RABBITMQ_URL> -e ENGINE_URL=<ENGINE_URL> -p 127.0.0.1:3001:3001 game-service
 ```
 
 [GS-ADR-1](docs/adr/container-image.md) describes the image.
