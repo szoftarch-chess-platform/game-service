@@ -1,9 +1,10 @@
 import { Module } from '@nestjs/common';
 import { EngineClient } from './engine.client';
-import { AppConfigService } from '../config/config.service';
+import { AppConfigModule } from '../config/config.module';
 
 @Module({
-  providers: [AppConfigService, EngineClient],
+  imports: [AppConfigModule],
+  providers: [EngineClient],
   exports: [EngineClient],
 })
 export class EngineModule {}

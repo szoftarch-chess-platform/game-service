@@ -38,16 +38,22 @@ describe('AppConfigService', () => {
     );
   });
 
-  it.each(['0', '65536', '3001.5', '3001abc'])(
-    'stops with the port %s',
-    (port) => {
-      vi.stubEnv('PORT', port);
+  it.each([
+    '0',
+    '65536',
+    '3001.5',
+    '3001abc',
+    '3001.0',
+    '1e3',
+    '0x0bb9',
+    ' 3001',
+  ])('stops with the port %s', (port) => {
+    vi.stubEnv('PORT', port);
 
-      expect(() => new AppConfigService()).toThrow(
-        'The PORT environment variable must be a port number from 1 to 65535.',
-      );
-    },
-  );
+    expect(() => new AppConfigService()).toThrow(
+      'The PORT environment variable must be a port number from 1 to 65535.',
+    );
+  });
 
   it.each([
     ['REDIS_URL', 'http://127.0.0.1:6379', 'redis:// or rediss://'],

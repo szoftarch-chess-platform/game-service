@@ -32,9 +32,11 @@ function readRequired(name: string): string {
   return value;
 }
 
+// Only decimal digits, because Number() would also accept values such as 1e3, 0x0bb9 or 3001.0.
 function readPort(name: string): number {
-  const port = Number(readRequired(name));
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  const value = readRequired(name);
+  const port = Number(value);
+  if (!/^\d+$/.test(value) || port < 1 || port > 65535) {
     throw new Error(
       `The ${name} environment variable must be a port number from 1 to 65535.`,
     );
@@ -45,8 +47,9 @@ function readPort(name: string): number {
 
 function readUrl(name: string, protocols: string[]): string {
   const value = readRequired(name);
-  const schemes = protocols.map((protocol) => `${protocol}//`).join(' or ');
-  if (!URL.canParse(value) || !protocols.includes(new URL(value).protocol)) {
+  const url = URL.parse(value);
+  if (!url || !protocols.includes(url.protocol)) {
+    const schemes = protocols.map((protocol) => `${protocol}//`).join(' or ');
     throw new Error(
       `The ${name} environment variable must be a URL that starts with ${schemes}.`,
     );
