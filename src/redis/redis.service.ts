@@ -17,6 +17,131 @@ export interface OutboxEntry {
 // The list of the outbox. New events go to its head, so the oldest one is at its tail.
 const OUTBOX_KEY = 'outbox:events';
 
+// The deadlines of the running clocks as a sorted set, with members such as `<gameId>:white`.
+const DEADLINES_KEY = 'game:deadlines';
+
+// The users who wait for an opponent as the JSON of their players, with the one who has waited the longest at the head.
+const QUEUE_KEY = 'queue:players';
+
+const statusKey = (userId: string) => `user:status:${userId}`;
+const gameKey = (gameId: string) => `game:${gameId}`;
+
+// A user who waits or plays can neither join the queue nor start a game (ADR-10). KEYS[1] is the status of the user.
+const FREE_USER = `
+  local status = redis.call('GET', KEYS[1])
+  if status == 'queue' then
+    return 'alreadyInQueue'
+  end
+  if status then
+    return 'alreadyInGame'
+  end
+`;
+
+// KEYS are the status of the user, the game and the deadlines. ARGV are the game as JSON, its id, and the deadline
+// member of the running clock or an empty string with the score of the deadline.
+const START_GAME_SCRIPT = `${FREE_USER}
+  redis.call('SET', KEYS[2], ARGV[1])
+  redis.call('SET', KEYS[1], 'game:' .. ARGV[2])
+  if ARGV[3] ~= '' then
+    redis.call('ZADD', KEYS[3], ARGV[4], ARGV[3])
+  end
+  return 'started'
+`;
+
+// KEYS are the status of the user and the queue, and when a user waits, the status of that user, the new game and the
+// deadlines. ARGV are the user as JSON and the waiting user as the queue holds it or an empty string, and when a user
+// waits, the game as JSON, its id, and the deadline member of the clock of white with its score. The caller read the
+// head of the queue before, so a head that has changed since then, or that belongs to a user who does not wait any
+// more, makes the caller read it again.
+const JOIN_QUEUE_SCRIPT = `${FREE_USER}
+  local head = redis.call('LINDEX', KEYS[2], 0) or ''
+  if head ~= ARGV[2] then
+    return 'queueChanged'
+  end
+  if head == '' then
+    redis.call('SET', KEYS[1], 'queue')
+    redis.call('RPUSH', KEYS[2], ARGV[1])
+    return 'queued'
+  end
+  redis.call('LPOP', KEYS[2])
+  if redis.call('GET', KEYS[3]) ~= 'queue' then
+    return 'queueChanged'
+  end
+  redis.call('SET', KEYS[4], ARGV[3])
+  redis.call('SET', KEYS[1], 'game:' .. ARGV[4])
+  redis.call('SET', KEYS[3], 'game:' .. ARGV[4])
+  redis.call('ZADD', KEYS[5], ARGV[6], ARGV[5])
+  return 'matched'
+`;
+
+// KEYS are the status of the user and the queue. ARGV is the id of the user.
+const LEAVE_QUEUE_SCRIPT = `
+  if redis.call('GET', KEYS[1]) ~= 'queue' then
+    return 0
+  end
+  redis.call('DEL', KEYS[1])
+  for _, json in ipairs(redis.call('LRANGE', KEYS[2], 0, -1)) do
+    if cjson.decode(json).userId == ARGV[1] then
+      redis.call('LREM', KEYS[2], 1, json)
+      break
+    end
+  end
+  return 1
+`;
+
+// Both scripts change a game only if it is still stored with the number of moves that the caller read. A game that has
+// ended is deleted, so a late event finds no game.
+const UNCHANGED_GAME = `
+  local stored = redis.call('GET', KEYS[1])
+  if not stored or #cjson.decode(stored).moves ~= tonumber(ARGV[1]) then
+    return 0
+  end
+`;
+
+// KEYS are the game and the deadlines. ARGV are the stored number of moves, the game as JSON, the id of the game, and
+// the deadline member of the running clock or an empty string with the score of the deadline.
+const SAVE_MOVE_SCRIPT = `${UNCHANGED_GAME}
+  redis.call('SET', KEYS[1], ARGV[2])
+  redis.call('ZREM', KEYS[2], ARGV[3] .. ':white', ARGV[3] .. ':black')
+  if ARGV[4] ~= '' then
+    redis.call('ZADD', KEYS[2], ARGV[5], ARGV[4])
+  end
+  return 1
+`;
+
+/** The member and the score of the deadline of the running clock, or an empty member while no clock runs. */
+function deadlineOf(game: GameState): [string, number] {
+  const running = game.clock.running;
+  const remainingMs = running ? game.clock[`${running}Ms`] : undefined;
+  return running && remainingMs !== undefined
+    ? [`${game.gameId}:${running}`, Date.now() + remainingMs]
+    : ['', 0];
+}
+
+export type StartRefusal = 'alreadyInQueue' | 'alreadyInGame';
+
+export type JoinOutcome = StartRefusal | 'queued' | 'matched' | 'queueChanged';
+
+/** A user who waits in the queue, with the JSON that the queue holds. */
+export interface WaitingUser {
+  json: string;
+  player: UserPlayer;
+}
+
+// KEYS are the game, the deadlines, the outbox and the statuses of the users who play the game. ARGV are the stored
+// number of moves, the event as JSON and the id of the game. A status is deleted only while it still names this game.
+const FINISH_GAME_SCRIPT = `${UNCHANGED_GAME}
+  redis.call('DEL', KEYS[1])
+  redis.call('ZREM', KEYS[2], ARGV[3] .. ':white', ARGV[3] .. ':black')
+  for i = 4, #KEYS do
+    if redis.call('GET', KEYS[i]) == 'game:' .. ARGV[3] then
+      redis.call('DEL', KEYS[i])
+    end
+  end
+  redis.call('LPUSH', KEYS[3], ARGV[2])
+  return 1
+`;
+
 @Injectable()
 export class RedisService implements OnModuleInit, OnModuleDestroy {
   private client!: Redis;
@@ -50,7 +175,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
    * Retrieves current status of a user (idle, waiting in queue, or in a game).
    */
   async getUserStatus(userId: string): Promise<UserStatus> {
-    const val = await this.client.get(`user:status:${userId}`);
+    const val = await this.client.get(statusKey(userId));
     if (!val) {
       return { status: 'idle' };
     }
@@ -63,183 +188,141 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return { status: 'idle' };
   }
 
-  /**
-   * Atomically joins the queue if the user is not already queued or in a game.
-   * If at least 2 players are in queue, pops the two oldest (FIFO) and returns them.
-   */
-  async joinQueue(player: UserPlayer): Promise<{
-    error?: 'alreadyInQueue' | 'alreadyInGame';
-    matched?: [UserPlayer, UserPlayer];
-  }> {
-    const joinScript = `
-      local userId = KEYS[1]
-      local playerJson = ARGV[1]
-      local currentStatus = redis.call('GET', 'user:status:' .. userId)
-      if currentStatus then
-        if currentStatus == 'queue' then return {'error', 'alreadyInQueue'} end
-        if string.sub(currentStatus, 1, 5) == 'game:' then return {'error', 'alreadyInGame'} end
-      end
-      redis.call('SET', 'user:status:' .. userId, 'queue')
-      redis.call('RPUSH', 'queue:players', playerJson)
-      local len = redis.call('LLEN', 'queue:players')
-      if len >= 2 then
-        local p1 = redis.call('LPOP', 'queue:players')
-        local p2 = redis.call('LPOP', 'queue:players')
-        return {'matched', p1, p2}
-      end
-      return {'ok'}
-    `;
+  /** The user who has waited the longest, whom `joinQueue` pairs with the next user. */
+  async peekQueue(): Promise<WaitingUser | undefined> {
+    const json = await this.client.lindex(QUEUE_KEY, 0);
+    return json ? { json, player: JSON.parse(json) as UserPlayer } : undefined;
+  }
 
-    const result = (await this.client.eval(
-      joinScript,
-      1,
-      player.userId,
+  /**
+   * Puts a free user into the queue, or pairs the user with the waiting user that `peekQueue` returned and stores their
+   * new game, in one script (ADR-3). It answers `queueChanged` and changes nothing else when the queue no longer starts
+   * with that waiting user.
+   */
+  async joinQueue(
+    player: UserPlayer,
+    pairing?: { waiting: WaitingUser; game: GameState },
+  ): Promise<JoinOutcome> {
+    const keys = [statusKey(player.userId), QUEUE_KEY];
+    const args: (string | number)[] = [
       JSON.stringify(player),
-    )) as [string, string, string?] | null;
-
-    if (result) {
-      if (result[0] === 'error') {
-        return { error: result[1] as 'alreadyInQueue' | 'alreadyInGame' };
-      }
-      if (result[0] === 'matched' && result[1] && result[2]) {
-        const p1 = JSON.parse(result[1]) as UserPlayer;
-        const p2 = JSON.parse(result[2]) as UserPlayer;
-        return { matched: [p1, p2] };
-      }
-    }
-
-    return {};
-  }
-
-  /**
-   * Removes user from queue if present.
-   */
-  async leaveQueue(userId: string): Promise<boolean> {
-    const status = await this.getUserStatus(userId);
-    if (status.status !== 'queue') {
-      return false;
-    }
-
-    // Lua script to atomically remove player from queue and del status
-    const leaveScript = `
-      local userId = KEYS[1]
-      redis.call('DEL', 'user:status:' .. userId)
-      local players = redis.call('LRANGE', 'queue:players', 0, -1)
-      for i, pJson in ipairs(players) do
-        local p = cjson.decode(pJson)
-        if p.userId == userId then
-          redis.call('LREM', 'queue:players', 1, pJson)
-          break
-        end
-      end
-      return 1
-    `;
-
-    await this.client.eval(leaveScript, 1, userId);
-    return true;
-  }
-
-  /**
-   * Stores a new game in Redis, sets user statuses, and sets initial clock deadline if running.
-   */
-  async createGame(game: GameState): Promise<void> {
-    const pipeline = this.client.pipeline();
-
-    pipeline.set(`game:${game.gameId}`, JSON.stringify(game));
-
-    if (game.white.kind === 'user') {
-      pipeline.set(`user:status:${game.white.userId}`, `game:${game.gameId}`);
-    }
-    if (game.black.kind === 'user') {
-      pipeline.set(`user:status:${game.black.userId}`, `game:${game.gameId}`);
-    }
-
-    // Set clock deadline if clock is running
-    if (game.clock.running) {
-      const remainingMs =
-        game.clock.running === 'white'
-          ? (game.clock.whiteMs ?? 600000)
-          : (game.clock.blackMs ?? 600000);
-      const deadline = Date.now() + remainingMs;
-      pipeline.zadd(
-        'game:deadlines',
-        deadline,
-        `${game.gameId}:${game.clock.running}`,
+      pairing?.waiting.json ?? '',
+    ];
+    if (pairing) {
+      const { waiting, game } = pairing;
+      keys.push(
+        statusKey(waiting.player.userId),
+        gameKey(game.gameId),
+        DEADLINES_KEY,
       );
+      args.push(JSON.stringify(game), game.gameId, ...deadlineOf(game));
     }
+    return (await this.client.eval(
+      JOIN_QUEUE_SCRIPT,
+      keys.length,
+      ...keys,
+      ...args,
+    )) as JoinOutcome;
+  }
 
-    await pipeline.exec();
+  /** Takes a waiting user out of the queue. Returns false when the user does not wait, for example after a pairing. */
+  async leaveQueue(userId: string): Promise<boolean> {
+    const left = await this.client.eval(
+      LEAVE_QUEUE_SCRIPT,
+      2,
+      statusKey(userId),
+      QUEUE_KEY,
+      userId,
+    );
+    return left === 1;
+  }
+
+  /** Stores a new game of a user against the bot if the user is free, and returns the refusal otherwise (ADR-10). */
+  async startGame(
+    userId: string,
+    game: GameState,
+  ): Promise<StartRefusal | undefined> {
+    const answer = await this.client.eval(
+      START_GAME_SCRIPT,
+      3,
+      statusKey(userId),
+      gameKey(game.gameId),
+      DEADLINES_KEY,
+      JSON.stringify(game),
+      game.gameId,
+      ...deadlineOf(game),
+    );
+    return answer === 'started' ? undefined : (answer as StartRefusal);
   }
 
   /**
    * Loads a game from Redis.
    */
   async getGame(gameId: string): Promise<GameState | null> {
-    const data = await this.client.get(`game:${gameId}`);
+    const data = await this.client.get(gameKey(gameId));
     if (!data) return null;
     return JSON.parse(data) as GameState;
   }
 
   /**
-   * Updates game state after a move or state change.
-   * If finished, clears user statuses, cleans up clock deadlines, and writes to outbox in the same transaction (ADR-6).
-   * Redis runs the commands of MULTI and EXEC together, so a lost connection or a restart of Redis cannot leave a
-   * finished game without its event, as a pipeline could.
+   * Saves a game that goes on after a move, with the deadline of the clock that runs now. It returns false and changes
+   * nothing when the stored game has ended or has another number of moves than `storedMoveCount`, because another
+   * event changed it since it was read (ADR-3).
    */
-  async saveGameState(
-    game: GameState,
-    isFinished: boolean,
-    outboxEvent?: GameFinishedEvent,
-  ): Promise<void> {
-    const transaction = this.client.multi();
-
-    transaction.set(`game:${game.gameId}`, JSON.stringify(game));
-
-    // Clear any existing deadlines for this game
-    transaction.zrem(
-      'game:deadlines',
-      `${game.gameId}:white`,
-      `${game.gameId}:black`,
+  async saveMove(game: GameState, storedMoveCount: number): Promise<boolean> {
+    const saved = await this.client.eval(
+      SAVE_MOVE_SCRIPT,
+      2,
+      gameKey(game.gameId),
+      DEADLINES_KEY,
+      storedMoveCount,
+      JSON.stringify(game),
+      game.gameId,
+      ...deadlineOf(game),
     );
+    return saved === 1;
+  }
 
-    if (isFinished) {
-      if (game.white.kind === 'user') {
-        transaction.del(`user:status:${game.white.userId}`);
-      }
-      if (game.black.kind === 'user') {
-        transaction.del(`user:status:${game.black.userId}`);
-      }
-      if (outboxEvent) {
-        transaction.lpush(OUTBOX_KEY, JSON.stringify(outboxEvent));
-      }
-    } else if (game.clock.running) {
-      const remainingMs =
-        game.clock.running === 'white'
-          ? (game.clock.whiteMs ?? 600000)
-          : (game.clock.blackMs ?? 600000);
-      const deadline = Date.now() + remainingMs;
-      transaction.zadd(
-        'game:deadlines',
-        deadline,
-        `${game.gameId}:${game.clock.running}`,
-      );
-    }
-
-    await transaction.exec();
+  /**
+   * Ends a game. It deletes the game, its deadlines and the statuses of its users, and it adds the event of the end to
+   * the outbox (ADR-6). Redis runs a script as a whole, so neither a lost connection nor a restart of Redis can leave a
+   * finished game without its event. Like `saveMove`, it returns false and changes nothing when the stored game has
+   * ended or changed since it was read, so a game ends only once.
+   */
+  async finishGame(
+    game: GameState,
+    storedMoveCount: number,
+    event: GameFinishedEvent,
+  ): Promise<boolean> {
+    const statusKeys = [game.white, game.black].flatMap((player) =>
+      player.kind === 'user' ? [statusKey(player.userId)] : [],
+    );
+    const finished = await this.client.eval(
+      FINISH_GAME_SCRIPT,
+      3 + statusKeys.length,
+      gameKey(game.gameId),
+      DEADLINES_KEY,
+      OUTBOX_KEY,
+      ...statusKeys,
+      storedMoveCount,
+      JSON.stringify(event),
+      game.gameId,
+    );
+    return finished === 1;
   }
 
   /**
    * Retrieves clock deadlines that have expired as of `now`.
    */
   async getExpiredDeadlines(now: number): Promise<string[]> {
-    return this.client.zrangebyscore('game:deadlines', 0, now);
+    return this.client.zrangebyscore(DEADLINES_KEY, 0, now);
   }
 
   /**
    * Removes a specific deadline from the set. Returns number of removed elements (1 if removed).
    */
   async removeDeadline(member: string): Promise<number> {
-    return this.client.zrem('game:deadlines', member);
+    return this.client.zrem(DEADLINES_KEY, member);
   }
 
   /**

@@ -21,6 +21,9 @@
 - ✅ Read user identity from `x-user-id` and `x-user-name` headers during WebSocket handshake (ADR-4).
 - ✅ Contract events on `/ws/game` implemented (`joinQueue`, `leaveQueue`, `startBotGame`, `makeMove`, `resign`, `getState`) with acknowledgments and error codes (`game-service.asyncapi.yaml`).
 - ✅ Matchmaking queue (FIFO) and games in Redis, atomic Lua scripts for queue and updates (ADR-3, ADR-10).
+- ✅ A game against the bot and a pairing are stored in one script together with the check that the users are free, so two starts at the same time make one game, and a user who leaves the queue during a pairing stays out of the game (ADR-3, ADR-10).
+- ✅ A move or an end is stored only if no other event has changed the game since it was read, otherwise the event reads the game again. An ended game is deleted from Redis, so a later event of it gets `gameNotFound`, and a move of the bot that comes after the end is dropped (ADR-3).
+- ✅ The user leaves the queue when the last connection closes (ADR-10), and an event whose handler fails gets the acknowledgement `internalError` instead of none (`game-service.asyncapi.yaml`).
 - ✅ Sakk játékszabályok chess.js alapokon: lépésvalidáció, matt, patt, hármas ismétlés, 50-lépéses szabály, elégtelen anyag (ADR-9, ADR-10).
 - ✅ Sakkóra (10 perc kezdő, nincs inkrementum, bot óra kezelés, FIDE 6.9 döntetlen timeout esetén elégtelen anyaggal) és Redis Sorted Set alapú háttérfigyelő (ADR-10).
 - ✅ Engine-service integráció `POST /moves` hívással, 15s timeouttal és 1 retry-val 500-as hiba esetén, motorkudarc esetén `aborted` / `engineFailure` lezárással (ADR-6, ADR-10).

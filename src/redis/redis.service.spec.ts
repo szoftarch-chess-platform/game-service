@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { RedisService } from './redis.service';
 import { AppConfigService } from '../config/config.service';
 import { GameFinishedEvent, GameState, UserPlayer } from '../domain/types';
@@ -77,6 +77,10 @@ describe('RedisService', () => {
     service.setClient(mockRedis);
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('reports user as idle when no status key is found', async () => {
     mockRedis.get.mockResolvedValue(null);
     const status = await service.getUserStatus('user-1');
@@ -98,97 +102,228 @@ describe('RedisService', () => {
     expect(status.gameId).toBe('0193c2bf-0a1b-7c2d-9e3f-4a5b6c7d8e9f');
   });
 
-  it('prevents user from joining queue if already in queue', async () => {
-    mockRedis.eval.mockResolvedValue(['error', 'alreadyInQueue']);
+  it('refuses a user who waits or plays already, as the script answers', async () => {
+    mockRedis.eval.mockResolvedValue('alreadyInGame');
     const player: UserPlayer = {
       kind: 'user',
       userId: 'user-1',
       name: 'Alice',
     };
-    const result = await service.joinQueue(player);
-    expect(result.error).toBe('alreadyInQueue');
+
+    await expect(service.joinQueue(player)).resolves.toBe('alreadyInGame');
   });
 
-  it('prevents user from joining queue if already in game', async () => {
-    mockRedis.eval.mockResolvedValue(['error', 'alreadyInGame']);
-    const player: UserPlayer = {
+  it('reads the head of the queue with the JSON that the queue holds', async () => {
+    const json = JSON.stringify({
       kind: 'user',
       userId: 'user-1',
       name: 'Alice',
-    };
-    const result = await service.joinQueue(player);
-    expect(result.error).toBe('alreadyInGame');
+    });
+    mockRedis.lindex.mockResolvedValue(json);
+
+    await expect(service.peekQueue()).resolves.toEqual({
+      json,
+      player: { kind: 'user', userId: 'user-1', name: 'Alice' },
+    });
+    expect(mockRedis.lindex).toHaveBeenCalledWith('queue:players', 0);
   });
 
-  it('joins queue and matches two players when queue length reaches 2', async () => {
-    const p1: UserPlayer = { kind: 'user', userId: 'user-1', name: 'Alice' };
-    const p2: UserPlayer = { kind: 'user', userId: 'user-2', name: 'Bob' };
+  it('finds nobody at the head of an empty queue', async () => {
+    mockRedis.lindex.mockResolvedValue(null);
 
-    mockRedis.eval.mockResolvedValue([
-      'matched',
-      JSON.stringify(p1),
-      JSON.stringify(p2),
-    ]);
-
-    const result = await service.joinQueue(p2);
-    expect(result.matched).toBeDefined();
-    expect(result.matched![0].userId).toBe('user-1');
-    expect(result.matched![1].userId).toBe('user-2');
+    await expect(service.peekQueue()).resolves.toBeUndefined();
   });
 
-  it('leaves queue successfully when queued', async () => {
-    mockRedis.get.mockResolvedValue('queue');
-    mockRedis.eval.mockResolvedValue(1);
+  it('joins an empty queue with the status and the queue only', async () => {
+    const player: UserPlayer = { kind: 'user', userId: 'user-2', name: 'Bob' };
+    mockRedis.eval.mockResolvedValue('queued');
 
-    const result = await service.leaveQueue('user-1');
-    expect(result).toBe(true);
-  });
+    await expect(service.joinQueue(player)).resolves.toBe('queued');
 
-  it('returns false when leaving queue if not in queue', async () => {
-    mockRedis.get.mockResolvedValue(null);
-    const result = await service.leaveQueue('user-1');
-    expect(result).toBe(false);
-  });
-
-  it('creates game and sets up pipeline commands', async () => {
-    const game = newGame();
-
-    await service.createGame(game);
-    const pipelineMock = mockRedis.pipeline();
-    expect(pipelineMock.set).toHaveBeenCalledWith(
-      'game:game-1',
-      JSON.stringify(game),
+    expect(mockRedis.eval).toHaveBeenCalledWith(
+      expect.stringContaining("redis.call('RPUSH', KEYS[2], ARGV[1])"),
+      2,
+      'user:status:user-2',
+      'queue:players',
+      JSON.stringify(player),
+      '',
     );
-    expect(pipelineMock.set).toHaveBeenCalledWith(
+  });
+
+  it('pairs with the waiting user and stores the game in the same script', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1000);
+    const game = newGame();
+    const waiting = {
+      json: JSON.stringify(game.white),
+      player: game.white as UserPlayer,
+    };
+    mockRedis.eval.mockResolvedValue('matched');
+
+    await expect(
+      service.joinQueue(game.black as UserPlayer, { waiting, game }),
+    ).resolves.toBe('matched');
+
+    expect(mockRedis.eval).toHaveBeenCalledWith(
+      expect.stringContaining("redis.call('SET', KEYS[4], ARGV[3])"),
+      5,
+      'user:status:user-2',
+      'queue:players',
       'user:status:user-1',
       'game:game-1',
+      'game:deadlines',
+      JSON.stringify(game.black),
+      waiting.json,
+      JSON.stringify(game),
+      'game-1',
+      'game-1:white',
+      601000,
     );
-    expect(pipelineMock.set).toHaveBeenCalledWith(
-      'user:status:user-2',
-      'game:game-1',
-    );
-    expect(pipelineMock.zadd).toHaveBeenCalled();
   });
 
-  it('saves a finished game and its outbox event in one transaction', async () => {
-    const game = newGame();
-    const event = finishedEvent(game);
+  it('leaves the queue only while the script finds the user waiting', async () => {
+    mockRedis.eval.mockResolvedValueOnce(1).mockResolvedValueOnce(0);
 
-    await service.saveGameState(game, true, event);
+    await expect(service.leaveQueue('user-1')).resolves.toBe(true);
+    await expect(service.leaveQueue('user-1')).resolves.toBe(false);
+
+    expect(mockRedis.eval).toHaveBeenCalledWith(
+      expect.stringContaining("~= 'queue'"),
+      2,
+      'user:status:user-1',
+      'queue:players',
+      'user-1',
+    );
+  });
+
+  it('starts a game against the bot with the status of the user in one script', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1000);
+    const game = newGame();
+    game.black = { kind: 'bot', name: 'Stockfish bot' };
+    game.clock = { whiteMs: 600000, running: 'white' };
+    mockRedis.eval.mockResolvedValue('started');
+
+    await expect(service.startGame('user-1', game)).resolves.toBeUndefined();
 
     expect(mockRedis.pipeline).not.toHaveBeenCalled();
-    const transaction = mockRedis.multi();
-    expect(transaction.set).toHaveBeenCalledWith(
+    expect(mockRedis.eval).toHaveBeenCalledWith(
+      expect.stringContaining("return 'started'"),
+      3,
+      'user:status:user-1',
       'game:game-1',
+      'game:deadlines',
       JSON.stringify(game),
+      'game-1',
+      'game-1:white',
+      601000,
     );
-    expect(transaction.del).toHaveBeenCalledWith('user:status:user-1');
-    expect(transaction.del).toHaveBeenCalledWith('user:status:user-2');
-    expect(transaction.lpush).toHaveBeenCalledWith(
+  });
+
+  it('starts a game in which the bot moves first without a deadline', async () => {
+    const game = newGame();
+    game.white = { kind: 'bot', name: 'Stockfish bot' };
+    game.clock = { blackMs: 600000 };
+    mockRedis.eval.mockResolvedValue('started');
+
+    await service.startGame('user-2', game);
+
+    expect(mockRedis.eval.mock.calls[0].slice(-2)).toEqual(['', 0]);
+  });
+
+  it('returns the refusal of a user who is not free', async () => {
+    mockRedis.eval.mockResolvedValue('alreadyInQueue');
+
+    await expect(service.startGame('user-1', newGame())).resolves.toBe(
+      'alreadyInQueue',
+    );
+  });
+
+  it('saves a move with the deadline of the running clock in one script', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1000);
+    const game = newGame();
+    game.moves = ['e2e4'];
+    game.clock = { whiteMs: 590000, blackMs: 600000, running: 'black' };
+    mockRedis.eval.mockResolvedValue(1);
+
+    await expect(service.saveMove(game, 0)).resolves.toBe(true);
+
+    expect(mockRedis.multi).not.toHaveBeenCalled();
+    expect(mockRedis.eval).toHaveBeenCalledWith(
+      expect.stringContaining("redis.call('SET', KEYS[1], ARGV[2])"),
+      2,
+      'game:game-1',
+      'game:deadlines',
+      0,
+      JSON.stringify(game),
+      'game-1',
+      'game-1:black',
+      601000,
+    );
+  });
+
+  it('saves a move without a deadline while the bot thinks', async () => {
+    const game = newGame();
+    game.black = { kind: 'bot', name: 'Stockfish bot' };
+    game.clock = { whiteMs: 590000 };
+    mockRedis.eval.mockResolvedValue(1);
+
+    await service.saveMove(game, 0);
+
+    const args = mockRedis.eval.mock.calls[0];
+    expect(args.slice(-2)).toEqual(['', 0]);
+  });
+
+  it('reports a move that the script refused because the game changed', async () => {
+    mockRedis.eval.mockResolvedValue(0);
+
+    await expect(service.saveMove(newGame(), 0)).resolves.toBe(false);
+  });
+
+  it('finishes a game with its outbox event in one script', async () => {
+    const game = newGame();
+    const event = finishedEvent(game);
+    mockRedis.eval.mockResolvedValue(1);
+
+    await expect(service.finishGame(game, 0, event)).resolves.toBe(true);
+
+    expect(mockRedis.multi).not.toHaveBeenCalled();
+    expect(mockRedis.eval).toHaveBeenCalledWith(
+      expect.stringContaining("redis.call('LPUSH', KEYS[3], ARGV[2])"),
+      5,
+      'game:game-1',
+      'game:deadlines',
       'outbox:events',
+      'user:status:user-1',
+      'user:status:user-2',
+      0,
       JSON.stringify(event),
+      'game-1',
     );
-    expect(transaction.exec).toHaveBeenCalled();
+  });
+
+  it('passes only the status of the user to the script in a game against the bot', async () => {
+    const game = newGame();
+    game.white = { kind: 'bot', name: 'Stockfish bot' };
+    mockRedis.eval.mockResolvedValue(1);
+
+    await service.finishGame(game, 0, finishedEvent(game));
+
+    const args = mockRedis.eval.mock.calls[0];
+    expect(args[1]).toBe(4);
+    expect(args.slice(2, 6)).toEqual([
+      'game:game-1',
+      'game:deadlines',
+      'outbox:events',
+      'user:status:user-2',
+    ]);
+  });
+
+  it('reports a game that has ended or changed already', async () => {
+    const game = newGame();
+    mockRedis.eval.mockResolvedValue(0);
+
+    await expect(
+      service.finishGame(game, 0, finishedEvent(game)),
+    ).resolves.toBe(false);
   });
 
   it('returns the oldest outbox event without removing it', async () => {
