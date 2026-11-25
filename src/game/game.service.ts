@@ -1,17 +1,25 @@
+import { randomInt, randomUUIDv7 } from 'node:crypto';
 import { Injectable, Logger } from '@nestjs/common';
 import { Server } from 'socket.io';
-import { v7 as uuidv7 } from 'uuid';
-import { RedisService } from '../redis/redis.service';
-import { EngineClient } from '../engine/engine.client';
+import {
+  COMMAND_TIMEOUT_MS,
+  Deadline,
+  Pairing,
+  RedisService,
+  StartRefusal,
+} from '../redis/redis.service';
+import { EngineClient, MAX_MOVE_REQUEST_MS } from '../engine/engine.client';
 import { ChessRules } from '../domain/chess-rules';
 import {
   BotPlayer,
+  Clock,
   Color,
   FinishedGame,
   GameEndReason,
   GameFinishedEvent,
   GameResult,
   GameState,
+  MoveMadePayload,
   OperationResponse,
   Player,
   StateResponse,
@@ -20,8 +28,51 @@ import {
 
 const STARTING_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
+// Every user has 10 minutes for the whole game (ADR-10).
+const INITIAL_MS = 10 * 60 * 1000;
+
+// The bot has no clock, but its move has to be stored by this time after its turn began, which is the longest move
+// request with its repeat and the longest wait for storing the move. After that any instance asks the engine again
+// (GS-ADR-3).
+const BOT_MOVE_DEADLINE_MS = MAX_MOVE_REQUEST_MS + COMMAND_TIMEOUT_MS;
+
+// An event that finds the game or the queue changed by another event since it read them reads them again, at most
+// this often.
+const MAX_ATTEMPTS = 3;
+
+/** The answer of an attempt that found the game or the queue changed by another event since it read them. */
+const CHANGED = Symbol('changed');
+
 export interface ExtendedGameState extends GameState {
   lastMoveTimestamp?: number;
+}
+
+/** The color of a user in a game, or undefined for a user who does not play it. */
+function colorOf(game: GameState, userId: string): Color | undefined {
+  return (['white', 'black'] as const).find((color) => {
+    const player = game[color];
+    return player.kind === 'user' && player.userId === userId;
+  });
+}
+
+/** The color whose turn it is. */
+function turnOf(game: GameState): Color {
+  return game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
+}
+
+/** The time of the last move, or of the start before the first move. */
+function lastMoveTime(game: ExtendedGameState): number {
+  return game.lastMoveTimestamp ?? new Date(game.startedAt).getTime();
+}
+
+/** What the game waits for next, which is the clock of the user whose turn it is or the move of the bot (GS-ADR-3). */
+function nextDeadline(game: ExtendedGameState): Deadline {
+  const color = turnOf(game);
+  const limit =
+    game[color].kind === 'bot'
+      ? BOT_MOVE_DEADLINE_MS
+      : (game.clock[`${color}Ms`] ?? 0);
+  return { color, at: lastMoveTime(game) + limit };
 }
 
 @Injectable()
@@ -38,28 +89,31 @@ export class GameService {
     this.server = server;
   }
 
+  /** The time since the last move, or since the start before the first move. */
+  private elapsedSinceLastMove(game: ExtendedGameState, now: number): number {
+    return Math.max(0, now - lastMoveTime(game));
+  }
+
+  /** The clock as it is now, with the time since the last move taken off the side whose clock runs. */
+  private currentClock(game: ExtendedGameState, now: number): Clock {
+    const clock = { ...game.clock };
+    const running = clock.running;
+    const remainingMs = running ? clock[`${running}Ms`] : undefined;
+    if (running && remainingMs !== undefined) {
+      clock[`${running}Ms`] = Math.max(
+        0,
+        remainingMs - this.elapsedSinceLastMove(game, now),
+      );
+    }
+    return clock;
+  }
+
   private toPublicGameState(
     game: ExtendedGameState,
     now: number = Date.now(),
   ): GameState {
     const { lastMoveTimestamp, ...publicGame } = game;
-    if (publicGame.clock?.running) {
-      const runningSide = publicGame.clock.running;
-      const lastTimestamp =
-        lastMoveTimestamp ?? new Date(publicGame.startedAt).getTime();
-      const elapsedMs = Math.max(0, now - lastTimestamp);
-      const clockCopy = { ...publicGame.clock };
-      if (runningSide === 'white' && clockCopy.whiteMs !== undefined) {
-        clockCopy.whiteMs = Math.max(0, clockCopy.whiteMs - elapsedMs);
-      } else if (runningSide === 'black' && clockCopy.blackMs !== undefined) {
-        clockCopy.blackMs = Math.max(0, clockCopy.blackMs - elapsedMs);
-      }
-      return {
-        ...publicGame,
-        clock: clockCopy,
-      };
-    }
-    return publicGame;
+    return { ...publicGame, clock: this.currentClock(game, now) };
   }
 
   private broadcastToUsers(
@@ -77,32 +131,105 @@ export class GameService {
     }
   }
 
+  private userIdsOf(game: GameState): string[] {
+    return [game.white, game.black].flatMap((player) =>
+      player.kind === 'user' ? [player.userId] : [],
+    );
+  }
+
   /**
-   * User requests to join the matchmaking queue.
+   * Runs an attempt until it gives an answer. An attempt answers `CHANGED` when another event has changed the game or
+   * the queue since it read them, and the next attempt reads them again, as ADR-3 requires for events that arrive at
+   * the same time.
+   */
+  private async retryOnChange<T>(
+    attempt: () => Promise<T | typeof CHANGED>,
+    operation: string,
+  ): Promise<T> {
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      const answer = await attempt();
+      if (answer !== CHANGED) {
+        return answer;
+      }
+    }
+    throw new Error(
+      `${operation} found what it read changed ${MAX_ATTEMPTS} times in a row.`,
+    );
+  }
+
+  private refusal(code: StartRefusal): OperationResponse {
+    return {
+      ok: false,
+      error: {
+        code,
+        message:
+          code === 'alreadyInQueue'
+            ? 'User is already in queue.'
+            : 'User is already in an active game.',
+      },
+    };
+  }
+
+  /**
+   * A new game of two players with colors drawn at random and the clock of white running, unless the bot plays white
+   * (ADR-10).
+   */
+  private newGame(player: Player, opponent: Player): ExtendedGameState {
+    const [white, black] =
+      randomInt(2) === 0 ? [player, opponent] : [opponent, player];
+    const now = new Date();
+    return {
+      gameId: randomUUIDv7(),
+      variant: 'standard',
+      white,
+      black,
+      timeControl: { initialMs: INITIAL_MS },
+      startedAt: now.toISOString(),
+      moves: [],
+      fen: STARTING_FEN,
+      clock: ChessRules.createInitialClock(white, black, INITIAL_MS),
+      lastMoveTimestamp: now.getTime(),
+    };
+  }
+
+  /** Every connection of the users of a new game gets `gameStarted`. */
+  private announceStart(game: ExtendedGameState) {
+    this.broadcastToUsers(
+      this.userIdsOf(game),
+      'gameStarted',
+      { game: this.toPublicGameState(game) },
+      game.gameId,
+    );
+  }
+
+  /**
+   * User requests to join the matchmaking queue. When another user waits, the two play at once. The game is prepared
+   * for the user at the head of the queue, and a queue that has changed meanwhile is read again.
    */
   async joinQueue(userId: string, name: string): Promise<OperationResponse> {
     const player: UserPlayer = { kind: 'user', userId, name };
-    const result = await this.redisService.joinQueue(player);
-
-    if (result.error) {
-      return {
-        ok: false,
-        error: {
-          code: result.error,
-          message:
-            result.error === 'alreadyInQueue'
-              ? 'User is already in queue.'
-              : 'User is already in an active game.',
-        },
-      };
-    }
-
-    if (result.matched) {
-      const [p1, p2] = result.matched;
-      await this.initiatePvPGame(p1, p2);
-    }
-
-    return { ok: true };
+    return this.retryOnChange(async () => {
+      const waiting = await this.redisService.peekQueue();
+      let pairing: Pairing | undefined;
+      if (waiting) {
+        const game = this.newGame(waiting.player, player);
+        pairing = { waiting, game, deadline: nextDeadline(game) };
+      }
+      const outcome = await this.redisService.joinQueue(player, pairing);
+      switch (outcome) {
+        case 'queueChanged':
+          return CHANGED;
+        case 'alreadyInQueue':
+        case 'alreadyInGame':
+          return this.refusal(outcome);
+        case 'queued':
+          return { ok: true };
+        case 'matched':
+          // Only a pairing can match.
+          this.announceStart(pairing!.game);
+          return { ok: true };
+      }
+    }, 'Joining the queue');
   }
 
   /**
@@ -123,106 +250,31 @@ export class GameService {
   }
 
   /**
-   * User starts a game against the Stockfish bot.
+   * User starts a game against the Stockfish bot. The check that the user is free and the new game are stored together,
+   * so two starts at the same time make only one game.
    */
   async startBotGame(userId: string, name: string): Promise<OperationResponse> {
-    const status = await this.redisService.getUserStatus(userId);
-    if (status.status === 'queue') {
-      return {
-        ok: false,
-        error: {
-          code: 'alreadyInQueue',
-          message: 'User is currently in queue.',
-        },
-      };
-    }
-    if (status.status === 'game') {
-      return {
-        ok: false,
-        error: {
-          code: 'alreadyInGame',
-          message: 'User is already in an active game.',
-        },
-      };
-    }
-
     const user: UserPlayer = { kind: 'user', userId, name };
     const bot: BotPlayer = { kind: 'bot', name: 'Stockfish bot' };
+    const game = this.newGame(user, bot);
 
-    // Random colors (ADR-10)
-    const isUserWhite = Math.random() < 0.5;
-    const white: Player = isUserWhite ? user : bot;
-    const black: Player = isUserWhite ? bot : user;
-
-    const gameId = uuidv7();
-    const now = new Date();
-    const startedAt = now.toISOString();
-
-    const game: ExtendedGameState = {
-      gameId,
-      variant: 'standard',
-      white,
-      black,
-      timeControl: { initialMs: 600000 },
-      startedAt,
-      moves: [],
-      fen: STARTING_FEN,
-      clock: ChessRules.createInitialClock(white, black),
-      lastMoveTimestamp: now.getTime(),
-    };
-
-    await this.redisService.createGame(game);
-
-    this.broadcastToUsers(
-      [userId],
-      'gameStarted',
-      { game: this.toPublicGameState(game) },
-      gameId,
+    const refused = await this.redisService.startGame(
+      userId,
+      game,
+      nextDeadline(game),
     );
+    if (refused) {
+      return this.refusal(refused);
+    }
+
+    this.announceStart(game);
 
     // If bot plays white, its first move arrives as moveMade (AsyncAPI contract)
-    if (white.kind === 'bot') {
-      this.executeBotMoveAsync(game).catch((err) => {
-        this.logger.error(`Error in bot first move: ${err.message}`);
-      });
+    if (game.white.kind === 'bot') {
+      this.requestBotMove(game);
     }
 
     return { ok: true };
-  }
-
-  /**
-   * Pairs two human players and initializes the game.
-   */
-  private async initiatePvPGame(p1: UserPlayer, p2: UserPlayer) {
-    const isP1White = Math.random() < 0.5;
-    const white = isP1White ? p1 : p2;
-    const black = isP1White ? p2 : p1;
-
-    const gameId = uuidv7();
-    const now = new Date();
-    const startedAt = now.toISOString();
-
-    const game: ExtendedGameState = {
-      gameId,
-      variant: 'standard',
-      white,
-      black,
-      timeControl: { initialMs: 600000 },
-      startedAt,
-      moves: [],
-      fen: STARTING_FEN,
-      clock: ChessRules.createInitialClock(white, black),
-      lastMoveTimestamp: now.getTime(),
-    };
-
-    await this.redisService.createGame(game);
-
-    this.broadcastToUsers(
-      [p1.userId, p2.userId],
-      'gameStarted',
-      { game: this.toPublicGameState(game) },
-      gameId,
-    );
   }
 
   /**
@@ -233,6 +285,17 @@ export class GameService {
     gameId: string,
     uciMove: string,
   ): Promise<OperationResponse> {
+    return this.retryOnChange(
+      () => this.tryMove(userId, gameId, uciMove),
+      'A move',
+    );
+  }
+
+  private async tryMove(
+    userId: string,
+    gameId: string,
+    uciMove: string,
+  ): Promise<OperationResponse | typeof CHANGED> {
     const game = (await this.redisService.getGame(
       gameId,
     )) as ExtendedGameState | null;
@@ -243,10 +306,8 @@ export class GameService {
       };
     }
 
-    // Check if user is a player in this game
-    const isWhite = game.white.kind === 'user' && game.white.userId === userId;
-    const isBlack = game.black.kind === 'user' && game.black.userId === userId;
-    if (!isWhite && !isBlack) {
+    const color = colorOf(game, userId);
+    if (!color) {
       return {
         ok: false,
         error: {
@@ -256,45 +317,44 @@ export class GameService {
       };
     }
 
-    const currentTurnColor: Color =
-      game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
-    const isUserTurn =
-      (isWhite && currentTurnColor === 'white') ||
-      (isBlack && currentTurnColor === 'black');
-    if (!isUserTurn) {
+    if (turnOf(game) !== color) {
       return {
         ok: false,
         error: { code: 'notYourTurn', message: 'It is not your turn.' },
       };
     }
 
-    // Calculate elapsed time
+    const storedMoveCount = game.moves.length;
     const now = Date.now();
-    const lastTimestamp =
-      game.lastMoveTimestamp ?? new Date(game.startedAt).getTime();
-    const elapsedMs = Math.max(0, now - lastTimestamp);
 
     const { updatedClock, timedOut } = ChessRules.updateClockOnMove(
       game.clock,
       game.white,
       game.black,
-      currentTurnColor,
-      elapsedMs,
+      color,
+      this.elapsedSinceLastMove(game, now),
     );
 
-    const playerUserIds: string[] = [];
-    if (game.white.kind === 'user') playerUserIds.push(game.white.userId);
-    if (game.black.kind === 'user') playerUserIds.push(game.black.userId);
-
     if (timedOut) {
-      const evalRes = ChessRules.evaluateTimeout(game.fen, currentTurnColor);
-      await this.finalizeGame(
+      const evalRes = ChessRules.evaluateTimeout(game.fen, color);
+      const ended = await this.endGame(
         game,
+        storedMoveCount,
         evalRes.result,
         evalRes.reason,
         updatedClock,
       );
-      return { ok: true };
+      if (!ended) {
+        return CHANGED;
+      }
+      // The game ended on time before the move, so the move is not made (ADR-10).
+      return {
+        ok: false,
+        error: {
+          code: 'gameNotFound',
+          message: `Game ${gameId} ended on time before the move.`,
+        },
+      };
     }
 
     // Validate and apply move with chess.js
@@ -316,51 +376,64 @@ export class GameService {
     game.lastMoveTimestamp = now;
 
     if (moveResult.isGameOver) {
-      delete game.clock.running;
-    }
-
-    // Broadcast moveMade to both players and spectators
-    this.broadcastToUsers(
-      playerUserIds,
-      'moveMade',
-      {
-        gameId,
-        move: uciMove,
-        fen: game.fen,
-        clock: game.clock,
-      },
-      gameId,
-    );
-
-    if (moveResult.isGameOver) {
       // Game over by checkmate, stalemate, repetition, 50-move, or insufficient material
-      await this.finalizeGame(
+      delete game.clock.running;
+      const ended = await this.endGame(
         game,
+        storedMoveCount,
         moveResult.result!,
         moveResult.reason!,
         game.clock,
+        this.moveMadeOf(game, uciMove),
       );
-    } else {
-      await this.redisService.saveGameState(game, false);
+      return ended ? { ok: true } : CHANGED;
+    }
 
-      // Check if next turn is the bot
-      const nextTurnColor: Color =
-        game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
-      const nextPlayer = nextTurnColor === 'white' ? game.white : game.black;
-      if (nextPlayer.kind === 'bot') {
-        this.executeBotMoveAsync(game).catch((err) => {
-          this.logger.error(`Error in bot move: ${err.message}`);
-        });
-      }
+    // The move is stored before anyone hears of it, so a move that another event has overtaken is never announced.
+    if (
+      !(await this.redisService.saveMove(
+        game,
+        storedMoveCount,
+        nextDeadline(game),
+      ))
+    ) {
+      return CHANGED;
+    }
+    this.broadcastToUsers(
+      this.userIdsOf(game),
+      'moveMade',
+      this.moveMadeOf(game, uciMove),
+      gameId,
+    );
+
+    // In a game against the bot the bot moves next.
+    if (game[turnOf(game)].kind === 'bot') {
+      this.requestBotMove(game);
     }
 
     return { ok: true };
   }
 
+  private moveMadeOf(game: GameState, move: string): MoveMadePayload {
+    return { gameId: game.gameId, move, fen: game.fen, clock: game.clock };
+  }
+
+  /** Asks the engine for the move of the bot without making the event that led to it wait. */
+  private requestBotMove(game: ExtendedGameState) {
+    this.executeBotMoveAsync(game).catch((err) => {
+      this.logger.error(
+        `The move of the bot in game ${game.gameId} failed: ${err.message}`,
+      );
+    });
+  }
+
   /**
-   * Executes a move chosen by engine-service.
+   * Executes a move chosen by engine-service. The game may have ended or changed while the engine thought, for example
+   * by a resignation or by the move that another instance asked for after the deadline of the bot, and then the move
+   * is dropped.
    */
   private async executeBotMoveAsync(game: ExtendedGameState) {
+    const storedMoveCount = game.moves.length;
     const botResponse = await this.engineClient.requestMove(
       game.fen,
       game.variant,
@@ -371,8 +444,7 @@ export class GameService {
       this.logger.error(
         `Engine failed to provide a move for game ${game.gameId}. Aborting.`,
       );
-      delete game.clock.running;
-      await this.finalizeGame(game, 'aborted', 'engineFailure', game.clock);
+      await this.abortForEngine(game, storedMoveCount);
       return;
     }
 
@@ -380,56 +452,90 @@ export class GameService {
     const moveResult = ChessRules.applyMove(game.fen, botMove, game.moves);
     if (!moveResult.valid) {
       this.logger.error(`Engine returned illegal move ${botMove}. Aborting.`);
-      delete game.clock.running;
-      await this.finalizeGame(game, 'aborted', 'engineFailure', game.clock);
+      await this.abortForEngine(game, storedMoveCount);
       return;
     }
 
-    const now = Date.now();
-    const botColor: Color = game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
-
-    // Update clock: start opponent's clock
-    game.clock.running = botColor === 'white' ? 'black' : 'white';
     game.moves.push(botMove);
     game.fen = moveResult.fen!;
-    game.lastMoveTimestamp = now;
+    // The clock of the user runs again after the move of the bot.
+    game.clock.running = turnOf(game);
+    game.lastMoveTimestamp = Date.now();
 
     if (moveResult.isGameOver) {
       delete game.clock.running;
-    }
-
-    const userIds: string[] = [];
-    if (game.white.kind === 'user') userIds.push(game.white.userId);
-    if (game.black.kind === 'user') userIds.push(game.black.userId);
-
-    this.broadcastToUsers(
-      userIds,
-      'moveMade',
-      {
-        gameId: game.gameId,
-        move: botMove,
-        fen: game.fen,
-        clock: game.clock,
-      },
-      game.gameId,
-    );
-
-    if (moveResult.isGameOver) {
-      await this.finalizeGame(
+      const ended = await this.endGame(
         game,
+        storedMoveCount,
         moveResult.result!,
         moveResult.reason!,
         game.clock,
+        this.moveMadeOf(game, botMove),
       );
-    } else {
-      await this.redisService.saveGameState(game, false);
+      if (!ended) {
+        this.logBotMoveDropped(game, botMove);
+      }
+      return;
     }
+
+    if (
+      !(await this.redisService.saveMove(
+        game,
+        storedMoveCount,
+        nextDeadline(game),
+      ))
+    ) {
+      this.logBotMoveDropped(game, botMove);
+      return;
+    }
+    this.broadcastToUsers(
+      this.userIdsOf(game),
+      'moveMade',
+      this.moveMadeOf(game, botMove),
+      game.gameId,
+    );
+  }
+
+  private async abortForEngine(
+    game: ExtendedGameState,
+    storedMoveCount: number,
+  ) {
+    const clock = { ...game.clock };
+    delete clock.running;
+    const ended = await this.endGame(
+      game,
+      storedMoveCount,
+      'aborted',
+      'engineFailure',
+      clock,
+    );
+    if (!ended) {
+      this.logger.log(
+        `Game ${game.gameId} ended or changed while the engine was thinking.`,
+      );
+    }
+  }
+
+  private logBotMoveDropped(game: GameState, move: string) {
+    this.logger.log(
+      `Game ${game.gameId} ended or changed while the engine was thinking, so its move ${move} is dropped.`,
+    );
   }
 
   /**
    * User resigns current game.
    */
   async resign(userId: string, gameId: string): Promise<OperationResponse> {
+    return this.retryOnChange(
+      () => this.tryResign(userId, gameId),
+      'A resignation',
+    );
+  }
+
+  private async tryResign(
+    userId: string,
+    gameId: string,
+  ): Promise<OperationResponse | typeof CHANGED> {
     const game = (await this.redisService.getGame(
       gameId,
     )) as ExtendedGameState | null;
@@ -440,9 +546,8 @@ export class GameService {
       };
     }
 
-    const isWhite = game.white.kind === 'user' && game.white.userId === userId;
-    const isBlack = game.black.kind === 'user' && game.black.userId === userId;
-    if (!isWhite && !isBlack) {
+    const color = colorOf(game, userId);
+    if (!color) {
       return {
         ok: false,
         error: {
@@ -452,51 +557,102 @@ export class GameService {
       };
     }
 
-    const result: GameResult = isWhite ? 'blackWon' : 'whiteWon';
-    delete game.clock.running;
+    const result: GameResult = color === 'white' ? 'blackWon' : 'whiteWon';
+    const clock = this.currentClock(game, Date.now());
+    delete clock.running;
 
-    await this.finalizeGame(game, result, 'resignation', game.clock);
-    return { ok: true };
+    const ended = await this.endGame(
+      game,
+      game.moves.length,
+      result,
+      'resignation',
+      clock,
+    );
+    return ended ? { ok: true } : CHANGED;
   }
 
   /**
-   * Handles timeout triggered by background clock service.
+   * Handles a deadline of a game that has passed, unless a move or an end came first. A user whose clock has run out
+   * loses on time, and a move of the bot that has not come in time is asked for again (GS-ADR-3).
    */
-  async handleTimeout(gameId: string, timedOutColor: Color) {
-    const game = (await this.redisService.getGame(
-      gameId,
-    )) as ExtendedGameState | null;
-    if (!game) return;
+  async handleExpiredDeadline(gameId: string, color: Color) {
+    await this.retryOnChange(async () => {
+      const game = (await this.redisService.getGame(
+        gameId,
+      )) as ExtendedGameState | null;
+      if (!game || turnOf(game) !== color) {
+        return;
+      }
+      if (game[color].kind === 'bot') {
+        return this.askEngineAgain(game);
+      }
+      return this.endOnTime(game, color);
+    }, 'A deadline');
+  }
 
-    if (timedOutColor === 'white') {
-      game.clock.whiteMs = 0;
-    } else {
-      game.clock.blackMs = 0;
+  /**
+   * Ends a game on time if the clock of the color has run out by now. The game decides it, so a deadline that a later
+   * move has replaced since it was read ends nothing.
+   */
+  private async endOnTime(
+    game: ExtendedGameState,
+    color: Color,
+  ): Promise<void | typeof CHANGED> {
+    const clock: Clock = this.currentClock(game, Date.now());
+    if ((clock[`${color}Ms`] ?? 0) > 0) {
+      return;
     }
-    delete game.clock.running;
+    delete clock.running;
 
-    const evalResult = ChessRules.evaluateTimeout(game.fen, timedOutColor);
-    await this.finalizeGame(
+    const evalResult = ChessRules.evaluateTimeout(game.fen, color);
+    const ended = await this.endGame(
       game,
+      game.moves.length,
       evalResult.result,
       evalResult.reason,
-      game.clock,
+      clock,
     );
+    if (!ended) {
+      return CHANGED;
+    }
+    this.logger.log(`Game ${game.gameId} ended on the time of ${color}.`);
   }
 
   /**
-   * Finalizes game: broadcasts gameEnded, saves state and enqueues game.finished.v1 event to outbox.
+   * Asks the engine again for a move of the bot that has not been stored in time, for example because the instance
+   * that asked for it has stopped. The claim of the deadline lets one instance ask, and it gives the move a new
+   * deadline, after which another instance asks if this one fails too.
    */
-  private async finalizeGame(
+  private async askEngineAgain(game: ExtendedGameState) {
+    const now = Date.now();
+    const claimed = await this.redisService.claimDeadline(
+      game.gameId,
+      turnOf(game),
+      now,
+      now + BOT_MOVE_DEADLINE_MS,
+    );
+    if (!claimed) {
+      return;
+    }
+    this.logger.warn(
+      `The move of the bot in game ${game.gameId} has not come in time, so the engine is asked again.`,
+    );
+    this.requestBotMove(game);
+  }
+
+  /**
+   * Ends a game unless another event has changed or ended it since it was read, and returns whether it did. The end and
+   * the event `game.finished.v1` are stored together (ADR-6). Then the players get the move that ended the game, if a
+   * move did, and `gameEnded`.
+   */
+  private async endGame(
     game: ExtendedGameState,
+    storedMoveCount: number,
     result: GameResult,
     reason: GameEndReason,
-    clock: GameState['clock'],
-  ) {
-    const userIds: string[] = [];
-    if (game.white.kind === 'user') userIds.push(game.white.userId);
-    if (game.black.kind === 'user') userIds.push(game.black.userId);
-
+    clock: Clock,
+    lastMove?: MoveMadePayload,
+  ): Promise<boolean> {
     const endedAt = new Date().toISOString();
 
     const finishedData: FinishedGame = {
@@ -513,15 +669,23 @@ export class GameService {
     };
 
     const outboxEvent: GameFinishedEvent = {
-      id: uuidv7(),
+      id: randomUUIDv7(),
       type: 'game.finished.v1',
       source: 'game-service',
       time: endedAt,
       data: finishedData,
     };
 
-    await this.redisService.saveGameState(game, true, outboxEvent);
+    if (
+      !(await this.redisService.finishGame(game, storedMoveCount, outboxEvent))
+    ) {
+      return false;
+    }
 
+    const userIds = this.userIdsOf(game);
+    if (lastMove) {
+      this.broadcastToUsers(userIds, 'moveMade', lastMove, game.gameId);
+    }
     this.broadcastToUsers(
       userIds,
       'gameEnded',
@@ -533,6 +697,7 @@ export class GameService {
       },
       game.gameId,
     );
+    return true;
   }
 
   /**

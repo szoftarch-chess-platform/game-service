@@ -1,6 +1,16 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { AppConfigService } from '../config/config.service';
 
+// The engine-service answers within the time limit of its contract, and the game-service waits five seconds longer
+// (ADR-6).
+const REQUEST_TIMEOUT_MS = 15_000;
+
+// A failed request is repeated once (ADR-6).
+const ATTEMPTS = 2;
+
+/** The longest time that a move request with its repeat can take. */
+export const MAX_MOVE_REQUEST_MS = ATTEMPTS * REQUEST_TIMEOUT_MS;
+
 export interface EngineMoveResponse {
   success: boolean;
   move?: string;
@@ -14,8 +24,8 @@ export class EngineClient {
   constructor(private readonly config: AppConfigService) {}
 
   /**
-   * Calls engine-service POST /moves to get a move for the given FEN.
-   * Enforces a 15-second timeout and 1 retry on 500 or network failure (ADR-6).
+   * Calls engine-service POST /moves to get a move for the given FEN. A request that takes longer than the time limit
+   * fails, and a failed request is repeated once, unless the engine-service refused the position (ADR-6).
    */
   async requestMove(
     fen: string,
@@ -23,21 +33,17 @@ export class EngineClient {
   ): Promise<EngineMoveResponse> {
     const url = `${this.config.engineUrl}/moves`;
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 15000);
-
+        // The time limit covers the body of the answer too.
         const response = await fetch(url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ fen, variant }),
-          signal: controller.signal,
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
-
-        clearTimeout(timeoutId);
 
         if (response.ok) {
           const data = (await response.json()) as { move: string };
@@ -57,8 +63,7 @@ export class EngineClient {
           };
         }
 
-        // On 500, retry once
-        if (attempt === 2) {
+        if (attempt === ATTEMPTS) {
           return {
             success: false,
             error: `Engine returned ${status} after retry`,
@@ -68,7 +73,7 @@ export class EngineClient {
         this.logger.error(
           `Engine request failed on attempt ${attempt}: ${err.message}`,
         );
-        if (attempt === 2) {
+        if (attempt === ATTEMPTS) {
           return {
             success: false,
             error: `Engine request failed: ${err.message}`,

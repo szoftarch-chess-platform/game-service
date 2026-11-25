@@ -1,4 +1,4 @@
-import { Logger } from '@nestjs/common';
+import { Logger, UseInterceptors } from '@nestjs/common';
 import {
   WebSocketGateway,
   WebSocketServer,
@@ -12,6 +12,7 @@ import {
 import { Server, Socket } from 'socket.io';
 import { GameService } from './game.service';
 import { OperationResponse, StateResponse } from '../domain/types';
+import { InternalErrorAckInterceptor } from './internal-error-ack.interceptor';
 
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -46,6 +47,7 @@ function normalizePayload(data: any): any {
   // Without long polling a connection needs no sticky session between the instances.
   transports: ['websocket'],
 })
+@UseInterceptors(InternalErrorAckInterceptor)
 export class GameGateway
   implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
 {
