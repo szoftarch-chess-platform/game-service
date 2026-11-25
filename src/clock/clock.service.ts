@@ -9,7 +9,7 @@ import {
 import { RedisService } from '../redis/redis.service';
 import { GameService } from '../game/game.service';
 
-// How often every instance looks for the clocks that have run out (GS-ADR-3).
+// How often every instance looks for the deadlines that have passed (GS-ADR-3).
 const CHECK_INTERVAL_MS = 1000;
 
 @Injectable()
@@ -39,21 +39,22 @@ export class ClockService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Ends the games whose clock has run out. The deadline of a game stays until its end removes it, so a game whose end
-   * fails, for example because Redis cannot be reached, is ended at a later check (ADR-10).
+   * Ends the games whose clock has run out, and asks the engine again for the moves of the bot that have not come in
+   * time. A deadline stays until a move or the end of its game replaces it, so a deadline whose handling fails, for
+   * example because Redis cannot be reached, is handled at a later check (ADR-10).
    */
   async checkExpiredDeadlines() {
     if (this.isChecking) return;
     this.isChecking = true;
 
     try {
-      const expired = await this.redisService.getExpiredClocks(Date.now());
-      // A game whose end fails does not hold up the others.
+      const expired = await this.redisService.getExpiredDeadlines(Date.now());
+      // A deadline whose handling fails does not hold up the others.
       await Promise.all(
         expired.map(({ gameId, color }) =>
-          this.gameService.handleTimeout(gameId, color).catch((err) => {
+          this.gameService.handleExpiredDeadline(gameId, color).catch((err) => {
             this.logger.error(
-              `Ending game ${gameId} on time failed: ${err.message}`,
+              `The deadline of ${color} in game ${gameId} failed: ${err.message}`,
             );
           }),
         ),

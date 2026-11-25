@@ -13,7 +13,6 @@
 ## Open questions
 
 - How the payloads of the events are validated against the contract.
-- The open questions of [GS-ADR-3](adr/game-state.md) on the Redis client and on a game that loses the move of the bot.
 
 ## Implementation status
 
@@ -24,7 +23,7 @@
 - ✅ The user leaves the queue when the last connection closes (ADR-10), and an event whose handler fails gets the acknowledgement `internalError` instead of none (`game-service.asyncapi.yaml`).
 - ✅ The rules of chess with chess.js, which are the legal moves, checkmate, stalemate, threefold repetition, the fifty-move rule and insufficient material (ADR-9, ADR-10).
 - ✅ Clocks of 10 minutes without increment and no clock for the bot, and a game that ends on time is a draw when the opponent has only the king or the king and a single bishop or knight (ADR-10). Every instance ends the games whose clock has run out ([GS-ADR-3](adr/game-state.md)).
-- ✅ The moves of the bot from `POST /moves` of the engine-service, with a timeout of 15 seconds and one repeat of a failed request except after 400 and 422, and an end as `aborted` with `engineFailure` when the engine fails (ADR-6, ADR-10).
+- ✅ The moves of the bot from `POST /moves` of the engine-service, with a timeout of 15 seconds and one repeat of a failed request except after 400 and 422, and an end as `aborted` with `engineFailure` when the engine fails (ADR-6, ADR-10). Another instance asks again for a move of the bot that has not been stored in time ([GS-ADR-3](adr/game-state.md)).
 - ✅ The outbox in Redis, from which every instance publishes `game.finished.v1` to the topic exchange `game.events` with the routing key `game.finished`, publisher confirms and the mandatory flag (ADR-6, [GS-ADR-3](adr/game-state.md)).
 - ✅ CI workflow in `.github/workflows/game-service.yml` for tests, format checks, builds and GHCR publishing on tags (ADR-2).
 

@@ -1,8 +1,14 @@
 import { randomInt, randomUUIDv7 } from 'node:crypto';
 import { Injectable, Logger } from '@nestjs/common';
 import { Server } from 'socket.io';
-import { RedisService, StartRefusal } from '../redis/redis.service';
-import { EngineClient } from '../engine/engine.client';
+import {
+  COMMAND_TIMEOUT_MS,
+  Deadline,
+  Pairing,
+  RedisService,
+  StartRefusal,
+} from '../redis/redis.service';
+import { EngineClient, MAX_MOVE_REQUEST_MS } from '../engine/engine.client';
 import { ChessRules } from '../domain/chess-rules';
 import {
   BotPlayer,
@@ -24,6 +30,11 @@ const STARTING_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
 // Every user has 10 minutes for the whole game (ADR-10).
 const INITIAL_MS = 10 * 60 * 1000;
+
+// The bot has no clock, but its move has to be stored by this time after its turn began, which is the longest move
+// request with its repeat and the longest wait for storing the move. After that any instance asks the engine again
+// (GS-ADR-3).
+const BOT_MOVE_DEADLINE_MS = MAX_MOVE_REQUEST_MS + COMMAND_TIMEOUT_MS;
 
 // An event that finds the game or the queue changed by another event since it read them reads them again, at most
 // this often.
@@ -49,6 +60,21 @@ function turnOf(game: GameState): Color {
   return game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
 }
 
+/** The time of the last move, or of the start before the first move. */
+function lastMoveTime(game: ExtendedGameState): number {
+  return game.lastMoveTimestamp ?? new Date(game.startedAt).getTime();
+}
+
+/** What the game waits for next, which is the clock of the user whose turn it is or the move of the bot (GS-ADR-3). */
+function nextDeadline(game: ExtendedGameState): Deadline {
+  const color = turnOf(game);
+  const limit =
+    game[color].kind === 'bot'
+      ? BOT_MOVE_DEADLINE_MS
+      : (game.clock[`${color}Ms`] ?? 0);
+  return { color, at: lastMoveTime(game) + limit };
+}
+
 @Injectable()
 export class GameService {
   private readonly logger = new Logger(GameService.name);
@@ -65,9 +91,7 @@ export class GameService {
 
   /** The time since the last move, or since the start before the first move. */
   private elapsedSinceLastMove(game: ExtendedGameState, now: number): number {
-    const lastTimestamp =
-      game.lastMoveTimestamp ?? new Date(game.startedAt).getTime();
-    return Math.max(0, now - lastTimestamp);
+    return Math.max(0, now - lastMoveTime(game));
   }
 
   /** The clock as it is now, with the time since the last move taken off the side whose clock runs. */
@@ -186,10 +210,11 @@ export class GameService {
     const player: UserPlayer = { kind: 'user', userId, name };
     return this.retryOnChange(async () => {
       const waiting = await this.redisService.peekQueue();
-      const pairing = waiting && {
-        waiting,
-        game: this.newGame(waiting.player, player),
-      };
+      let pairing: Pairing | undefined;
+      if (waiting) {
+        const game = this.newGame(waiting.player, player);
+        pairing = { waiting, game, deadline: nextDeadline(game) };
+      }
       const outcome = await this.redisService.joinQueue(player, pairing);
       switch (outcome) {
         case 'queueChanged':
@@ -233,7 +258,11 @@ export class GameService {
     const bot: BotPlayer = { kind: 'bot', name: 'Stockfish bot' };
     const game = this.newGame(user, bot);
 
-    const refused = await this.redisService.startGame(userId, game);
+    const refused = await this.redisService.startGame(
+      userId,
+      game,
+      nextDeadline(game),
+    );
     if (refused) {
       return this.refusal(refused);
     }
@@ -242,9 +271,7 @@ export class GameService {
 
     // If bot plays white, its first move arrives as moveMade (AsyncAPI contract)
     if (game.white.kind === 'bot') {
-      this.executeBotMoveAsync(game).catch((err) => {
-        this.logger.error(`Error in bot first move: ${err.message}`);
-      });
+      this.requestBotMove(game);
     }
 
     return { ok: true };
@@ -363,7 +390,13 @@ export class GameService {
     }
 
     // The move is stored before anyone hears of it, so a move that another event has overtaken is never announced.
-    if (!(await this.redisService.saveMove(game, storedMoveCount))) {
+    if (
+      !(await this.redisService.saveMove(
+        game,
+        storedMoveCount,
+        nextDeadline(game),
+      ))
+    ) {
       return CHANGED;
     }
     this.broadcastToUsers(
@@ -375,9 +408,7 @@ export class GameService {
 
     // In a game against the bot the bot moves next.
     if (game[turnOf(game)].kind === 'bot') {
-      this.executeBotMoveAsync(game).catch((err) => {
-        this.logger.error(`Error in bot move: ${err.message}`);
-      });
+      this.requestBotMove(game);
     }
 
     return { ok: true };
@@ -387,9 +418,19 @@ export class GameService {
     return { gameId: game.gameId, move, fen: game.fen, clock: game.clock };
   }
 
+  /** Asks the engine for the move of the bot without making the event that led to it wait. */
+  private requestBotMove(game: ExtendedGameState) {
+    this.executeBotMoveAsync(game).catch((err) => {
+      this.logger.error(
+        `The move of the bot in game ${game.gameId} failed: ${err.message}`,
+      );
+    });
+  }
+
   /**
-   * Executes a move chosen by engine-service. The game may have ended while the engine thought, for example by a
-   * resignation, and then the move is dropped.
+   * Executes a move chosen by engine-service. The game may have ended or changed while the engine thought, for example
+   * by a resignation or by the move that another instance asked for after the deadline of the bot, and then the move
+   * is dropped.
    */
   private async executeBotMoveAsync(game: ExtendedGameState) {
     const storedMoveCount = game.moves.length;
@@ -437,7 +478,13 @@ export class GameService {
       return;
     }
 
-    if (!(await this.redisService.saveMove(game, storedMoveCount))) {
+    if (
+      !(await this.redisService.saveMove(
+        game,
+        storedMoveCount,
+        nextDeadline(game),
+      ))
+    ) {
       this.logBotMoveDropped(game, botMove);
       return;
     }
@@ -464,14 +511,14 @@ export class GameService {
     );
     if (!ended) {
       this.logger.log(
-        `Game ${game.gameId} ended while the engine was thinking.`,
+        `Game ${game.gameId} ended or changed while the engine was thinking.`,
       );
     }
   }
 
   private logBotMoveDropped(game: GameState, move: string) {
     this.logger.log(
-      `Game ${game.gameId} ended while the engine was thinking, so its move ${move} is dropped.`,
+      `Game ${game.gameId} ended or changed while the engine was thinking, so its move ${move} is dropped.`,
     );
   }
 
@@ -525,33 +572,72 @@ export class GameService {
   }
 
   /**
-   * Handles timeout triggered by background clock service. A move or an end that came first makes the timeout stale.
+   * Handles a deadline of a game that has passed, unless a move or an end came first. A user whose clock has run out
+   * loses on time, and a move of the bot that has not come in time is asked for again (GS-ADR-3).
    */
-  async handleTimeout(gameId: string, timedOutColor: Color) {
+  async handleExpiredDeadline(gameId: string, color: Color) {
     await this.retryOnChange(async () => {
       const game = (await this.redisService.getGame(
         gameId,
       )) as ExtendedGameState | null;
-      if (game?.clock.running !== timedOutColor) {
+      if (!game || turnOf(game) !== color) {
         return;
       }
-
-      const clock: Clock = { ...game.clock, [`${timedOutColor}Ms`]: 0 };
-      delete clock.running;
-
-      const evalResult = ChessRules.evaluateTimeout(game.fen, timedOutColor);
-      const ended = await this.endGame(
-        game,
-        game.moves.length,
-        evalResult.result,
-        evalResult.reason,
-        clock,
-      );
-      if (!ended) {
-        return CHANGED;
+      if (game[color].kind === 'bot') {
+        return this.askEngineAgain(game);
       }
-      this.logger.log(`Game ${gameId} ended on the time of ${timedOutColor}.`);
-    }, 'A timeout');
+      return this.endOnTime(game, color);
+    }, 'A deadline');
+  }
+
+  /**
+   * Ends a game on time if the clock of the color has run out by now. The game decides it, so a deadline that a later
+   * move has replaced since it was read ends nothing.
+   */
+  private async endOnTime(
+    game: ExtendedGameState,
+    color: Color,
+  ): Promise<void | typeof CHANGED> {
+    const clock: Clock = this.currentClock(game, Date.now());
+    if ((clock[`${color}Ms`] ?? 0) > 0) {
+      return;
+    }
+    delete clock.running;
+
+    const evalResult = ChessRules.evaluateTimeout(game.fen, color);
+    const ended = await this.endGame(
+      game,
+      game.moves.length,
+      evalResult.result,
+      evalResult.reason,
+      clock,
+    );
+    if (!ended) {
+      return CHANGED;
+    }
+    this.logger.log(`Game ${game.gameId} ended on the time of ${color}.`);
+  }
+
+  /**
+   * Asks the engine again for a move of the bot that has not been stored in time, for example because the instance
+   * that asked for it has stopped. The claim of the deadline lets one instance ask, and it gives the move a new
+   * deadline, after which another instance asks if this one fails too.
+   */
+  private async askEngineAgain(game: ExtendedGameState) {
+    const now = Date.now();
+    const claimed = await this.redisService.claimDeadline(
+      game.gameId,
+      turnOf(game),
+      now,
+      now + BOT_MOVE_DEADLINE_MS,
+    );
+    if (!claimed) {
+      return;
+    }
+    this.logger.warn(
+      `The move of the bot in game ${game.gameId} has not come in time, so the engine is asked again.`,
+    );
+    this.requestBotMove(game);
   }
 
   /**
