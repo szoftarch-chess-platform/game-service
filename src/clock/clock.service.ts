@@ -8,7 +8,9 @@ import {
 } from '@nestjs/common';
 import { RedisService } from '../redis/redis.service';
 import { GameService } from '../game/game.service';
-import { Color } from '../domain/types';
+
+// How often every instance looks for the clocks that have run out (GS-ADR-3).
+const CHECK_INTERVAL_MS = 1000;
 
 @Injectable()
 export class ClockService implements OnModuleInit, OnModuleDestroy {
@@ -27,7 +29,7 @@ export class ClockService implements OnModuleInit, OnModuleDestroy {
       this.checkExpiredDeadlines().catch((err) => {
         this.logger.error(`Error checking clock deadlines: ${err.message}`);
       });
-    }, 1000);
+    }, CHECK_INTERVAL_MS);
   }
 
   onModuleDestroy() {
@@ -36,24 +38,26 @@ export class ClockService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Ends the games whose clock has run out. The deadline of a game stays until its end removes it, so a game whose end
+   * fails, for example because Redis cannot be reached, is ended at a later check (ADR-10).
+   */
   async checkExpiredDeadlines() {
     if (this.isChecking) return;
     this.isChecking = true;
 
     try {
-      const now = Date.now();
-      const expiredMembers = await this.redisService.getExpiredDeadlines(now);
-
-      for (const member of expiredMembers) {
-        const removed = await this.redisService.removeDeadline(member);
-        if (removed > 0) {
-          const [gameId, color] = member.split(':');
-          if (gameId && color) {
-            this.logger.log(`Game ${gameId} timed out on ${color}`);
-            await this.gameService.handleTimeout(gameId, color as Color);
-          }
-        }
-      }
+      const expired = await this.redisService.getExpiredClocks(Date.now());
+      // A game whose end fails does not hold up the others.
+      await Promise.all(
+        expired.map(({ gameId, color }) =>
+          this.gameService.handleTimeout(gameId, color).catch((err) => {
+            this.logger.error(
+              `Ending game ${gameId} on time failed: ${err.message}`,
+            );
+          }),
+        ),
+      );
     } finally {
       this.isChecking = false;
     }

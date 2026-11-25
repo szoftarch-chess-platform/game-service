@@ -1,4 +1,4 @@
-# ♟️ Game Service (NestJS Skeleton)
+# ♟️ Game Service
 
 Game service of the online chess platform. Its responsibilities are decided in ADR-1.
 
@@ -9,16 +9,17 @@ Game service of the online chess platform. Its responsibilities are decided in A
 ```
 game-service/
 ├── .github/workflows/        # CI workflow
-├── src/
+├── src/                          # Every test file is next to the file that it tests and ends in .spec.ts
 │   ├── main.ts                   # Entry point
-│   ├── app.module.ts             # Root module (imports GameModule)
+│   ├── app.module.ts             # Root module
 │   ├── health.controller.ts      # Health check endpoint
-│   ├── health.controller.spec.ts # Unit test suite using Vitest
-│   └── game/
-│       ├── game.module.ts        # Game module
-│       ├── game.service.ts       # Game service stub with TODO comments
-│       ├── game.gateway.ts       # WebSocket (Socket.IO) gateway stub with TODO comments
-│       └── spectate.gateway.ts   # WebSocket (Socket.IO) gateway stub of the spectators
+│   ├── clock/                    # The check of the clocks that have run out
+│   ├── config/                   # The settings and their checks
+│   ├── domain/                   # The rules of chess and the types of the contracts
+│   ├── engine/                   # The client of the engine-service
+│   ├── game/                     # The Socket.IO gateways and the operations of a live game
+│   ├── outbox/                   # The publisher of the outbox to RabbitMQ
+│   └── redis/                    # The state of the live games in Redis
 ├── docs/                         # Decisions, open questions and next steps
 ├── .env.example                  # Template of the settings on the host, which the infra setup script fills
 ├── .npmrc                        # npm settings
@@ -55,18 +56,17 @@ The service has no REST API. ADR-3 decides that every operation of a live game i
 ### WebSocket Events (Socket.IO):
 The service has two Socket.IO paths, and both accept only the WebSocket transport.
 
-`/ws/game` for the players:
-- `join_queue` -> Join matchmaking queue (stub)
-- `make_move` -> Send chess move (stub)
+`/ws/game` for the players has the events of the contract `game-service.asyncapi.yaml` of the infra repo.
 
-`/ws/spectate` for the spectators has no events yet.
+`/ws/spectate` for the spectators has no contract yet.
 
 ---
 
 ## 🚀 Running Locally
 
 ### Prerequisites
-- **Node.js**: v26+ (Active LTS)
+- **Node.js**: v26.1+ (Active LTS)
+- **Docker** for the tests of the Redis scripts
 
 ### 1. Install Dependencies
 ```bash
@@ -81,6 +81,7 @@ node ../infra/scripts/dev-setup.mjs
 ```
 
 ### 3. Run Tests (Vitest)
+The tests of `RedisService` start Redis in a container with Testcontainers, so Docker has to run. The other tests need nothing else.
 ```bash
 npm test
 ```

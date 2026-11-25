@@ -8,7 +8,7 @@ import {
 import { Observable, catchError, of } from 'rxjs';
 import { RejectedResponse } from '../domain/types';
 
-export const INTERNAL_ERROR_ACK: RejectedResponse = {
+const INTERNAL_ERROR_ACK: RejectedResponse = {
   ok: false,
   error: { code: 'internalError', message: 'The game-service failed.' },
 };

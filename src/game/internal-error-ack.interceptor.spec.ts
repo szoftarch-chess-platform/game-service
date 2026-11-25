@@ -1,10 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { CallHandler, ExecutionContext, Logger } from '@nestjs/common';
 import { firstValueFrom, of, throwError } from 'rxjs';
-import {
-  INTERNAL_ERROR_ACK,
-  InternalErrorAckInterceptor,
-} from './internal-error-ack.interceptor';
+import { InternalErrorAckInterceptor } from './internal-error-ack.interceptor';
 
 function contextOf(event: string): ExecutionContext {
   return {
@@ -33,7 +30,6 @@ describe('InternalErrorAckInterceptor', () => {
       ok: false,
       error: { code: 'internalError', message: 'The game-service failed.' },
     });
-    expect(answer).toBe(INTERNAL_ERROR_ACK);
     expect(log).toHaveBeenCalledWith(
       'The event getState failed.',
       expect.stringContaining('Redis connection lost'),

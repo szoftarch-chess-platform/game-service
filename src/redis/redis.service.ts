@@ -1,7 +1,12 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import Redis from 'ioredis';
 import { AppConfigService } from '../config/config.service';
-import { GameState, GameFinishedEvent, UserPlayer } from '../domain/types';
+import {
+  Color,
+  GameState,
+  GameFinishedEvent,
+  UserPlayer,
+} from '../domain/types';
 
 export interface UserStatus {
   status: 'idle' | 'queue' | 'game';
@@ -14,10 +19,17 @@ export interface OutboxEntry {
   event: GameFinishedEvent;
 }
 
+/** A clock that runs in a game. */
+export interface RunningClock {
+  gameId: string;
+  color: Color;
+}
+
 // The list of the outbox. New events go to its head, so the oldest one is at its tail.
 const OUTBOX_KEY = 'outbox:events';
 
-// The deadlines of the running clocks as a sorted set, with members such as `<gameId>:white`.
+// The deadlines of the running clocks as a sorted set, with members such as `<gameId>:white` and the time in
+// milliseconds at which the clock runs out as their scores.
 const DEADLINES_KEY = 'game:deadlines';
 
 // The users who wait for an opponent as the JSON of their players, with the one who has waited the longest at the head.
@@ -51,8 +63,8 @@ const START_GAME_SCRIPT = `${FREE_USER}
 // KEYS are the status of the user and the queue, and when a user waits, the status of that user, the new game and the
 // deadlines. ARGV are the user as JSON and the waiting user as the queue holds it or an empty string, and when a user
 // waits, the game as JSON, its id, and the deadline member of the clock of white with its score. The caller read the
-// head of the queue before, so a head that has changed since then, or that belongs to a user who does not wait any
-// more, makes the caller read it again.
+// head of the queue before, so a head that has changed since then makes the caller read it again. A head whose user
+// does not wait any more is dropped from the queue, and the caller reads it again too.
 const JOIN_QUEUE_SCRIPT = `${FREE_USER}
   local head = redis.call('LINDEX', KEYS[2], 0) or ''
   if head ~= ARGV[2] then
@@ -160,15 +172,6 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     if (this.client) {
       await this.client.quit().catch(() => {});
     }
-  }
-
-  // Exposed for tests or direct operations
-  getClient(): Redis {
-    return this.client;
-  }
-
-  setClient(client: Redis) {
-    this.client = client;
   }
 
   /**
@@ -312,17 +315,23 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Retrieves clock deadlines that have expired as of `now`.
+   * The clocks that have run out by `now`. A deadline stays until the script that saves the next move or ends the game
+   * replaces or removes it.
    */
-  async getExpiredDeadlines(now: number): Promise<string[]> {
-    return this.client.zrangebyscore(DEADLINES_KEY, 0, now);
-  }
-
-  /**
-   * Removes a specific deadline from the set. Returns number of removed elements (1 if removed).
-   */
-  async removeDeadline(member: string): Promise<number> {
-    return this.client.zrem(DEADLINES_KEY, member);
+  async getExpiredClocks(now: number): Promise<RunningClock[]> {
+    const members = await this.client.zrange(
+      DEADLINES_KEY,
+      '-inf',
+      String(now),
+      'BYSCORE',
+    );
+    return members.map((member) => {
+      const separator = member.lastIndexOf(':');
+      return {
+        gameId: member.slice(0, separator),
+        color: member.slice(separator + 1) as Color,
+      };
+    });
   }
 
   /**

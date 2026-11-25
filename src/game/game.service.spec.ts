@@ -196,6 +196,39 @@ describe('GameService', () => {
       }
     });
 
+    it('refuses a move that comes after the time ran out and ends the game on time', async () => {
+      mockRedis.getGame.mockResolvedValue({
+        ...activeGame,
+        lastMoveTimestamp: Date.now() - 600001,
+      });
+
+      const res = await service.makeMove('user-1', 'game-1', 'e2e4');
+
+      expect(res).toEqual({
+        ok: false,
+        error: {
+          code: 'gameNotFound',
+          message: 'Game game-1 ended on time before the move.',
+        },
+      });
+      expect(mockRedis.saveMove).not.toHaveBeenCalled();
+      expect(mockRedis.finishGame).toHaveBeenCalledWith(
+        expect.objectContaining({ moves: [] }),
+        0,
+        expect.objectContaining({
+          data: expect.objectContaining({
+            result: 'blackWon',
+            reason: 'timeout',
+          }),
+        }),
+      );
+      const names = mockServer
+        .to()
+        .emit.mock.calls.map(([name]: [string]) => name);
+      expect(names).not.toContain('moveMade');
+      expect(names).toContain('gameEnded');
+    });
+
     it('accepts legal move, updates clock and state, broadcasts moveMade', async () => {
       mockRedis.getGame.mockResolvedValue(activeGame);
       const res = await service.makeMove('user-1', 'game-1', 'e2e4');

@@ -1,6 +1,6 @@
+import { randomInt, randomUUIDv7 } from 'node:crypto';
 import { Injectable, Logger } from '@nestjs/common';
 import { Server } from 'socket.io';
-import { v7 as uuidv7 } from 'uuid';
 import { RedisService, StartRefusal } from '../redis/redis.service';
 import { EngineClient } from '../engine/engine.client';
 import { ChessRules } from '../domain/chess-rules';
@@ -22,11 +22,31 @@ import {
 
 const STARTING_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
-// An event that finds its game changed by another event since it read it reads the game again, at most this often.
+// Every user has 10 minutes for the whole game (ADR-10).
+const INITIAL_MS = 10 * 60 * 1000;
+
+// An event that finds the game or the queue changed by another event since it read them reads them again, at most
+// this often.
 const MAX_ATTEMPTS = 3;
+
+/** The answer of an attempt that found the game or the queue changed by another event since it read them. */
+const CHANGED = Symbol('changed');
 
 export interface ExtendedGameState extends GameState {
   lastMoveTimestamp?: number;
+}
+
+/** The color of a user in a game, or undefined for a user who does not play it. */
+function colorOf(game: GameState, userId: string): Color | undefined {
+  return (['white', 'black'] as const).find((color) => {
+    const player = game[color];
+    return player.kind === 'user' && player.userId === userId;
+  });
+}
+
+/** The color whose turn it is. */
+function turnOf(game: GameState): Color {
+  return game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
 }
 
 @Injectable()
@@ -43,16 +63,23 @@ export class GameService {
     this.server = server;
   }
 
+  /** The time since the last move, or since the start before the first move. */
+  private elapsedSinceLastMove(game: ExtendedGameState, now: number): number {
+    const lastTimestamp =
+      game.lastMoveTimestamp ?? new Date(game.startedAt).getTime();
+    return Math.max(0, now - lastTimestamp);
+  }
+
   /** The clock as it is now, with the time since the last move taken off the side whose clock runs. */
   private currentClock(game: ExtendedGameState, now: number): Clock {
     const clock = { ...game.clock };
     const running = clock.running;
     const remainingMs = running ? clock[`${running}Ms`] : undefined;
     if (running && remainingMs !== undefined) {
-      const lastTimestamp =
-        game.lastMoveTimestamp ?? new Date(game.startedAt).getTime();
-      const elapsedMs = Math.max(0, now - lastTimestamp);
-      clock[`${running}Ms`] = Math.max(0, remainingMs - elapsedMs);
+      clock[`${running}Ms`] = Math.max(
+        0,
+        remainingMs - this.elapsedSinceLastMove(game, now),
+      );
     }
     return clock;
   }
@@ -87,21 +114,22 @@ export class GameService {
   }
 
   /**
-   * Runs an attempt until it gives an answer. An attempt answers undefined when its game changed after it read it, and
-   * the next attempt reads the game again, as ADR-3 requires for two events of the same game.
+   * Runs an attempt until it gives an answer. An attempt answers `CHANGED` when another event has changed the game or
+   * the queue since it read them, and the next attempt reads them again, as ADR-3 requires for events that arrive at
+   * the same time.
    */
   private async retryOnChange<T>(
-    attempt: () => Promise<T | undefined>,
+    attempt: () => Promise<T | typeof CHANGED>,
     operation: string,
   ): Promise<T> {
     for (let i = 0; i < MAX_ATTEMPTS; i++) {
       const answer = await attempt();
-      if (answer !== undefined) {
+      if (answer !== CHANGED) {
         return answer;
       }
     }
     throw new Error(
-      `${operation} found its game changed ${MAX_ATTEMPTS} times in a row.`,
+      `${operation} found what it read changed ${MAX_ATTEMPTS} times in a row.`,
     );
   }
 
@@ -118,21 +146,36 @@ export class GameService {
     };
   }
 
-  /** A new game with the clock of white running, unless the bot plays white (ADR-10). */
-  private newGame(white: Player, black: Player): ExtendedGameState {
+  /**
+   * A new game of two players with colors drawn at random and the clock of white running, unless the bot plays white
+   * (ADR-10).
+   */
+  private newGame(player: Player, opponent: Player): ExtendedGameState {
+    const [white, black] =
+      randomInt(2) === 0 ? [player, opponent] : [opponent, player];
     const now = new Date();
     return {
-      gameId: uuidv7(),
+      gameId: randomUUIDv7(),
       variant: 'standard',
       white,
       black,
-      timeControl: { initialMs: 600000 },
+      timeControl: { initialMs: INITIAL_MS },
       startedAt: now.toISOString(),
       moves: [],
       fen: STARTING_FEN,
-      clock: ChessRules.createInitialClock(white, black),
+      clock: ChessRules.createInitialClock(white, black, INITIAL_MS),
       lastMoveTimestamp: now.getTime(),
     };
+  }
+
+  /** Every connection of the users of a new game gets `gameStarted`. */
+  private announceStart(game: ExtendedGameState) {
+    this.broadcastToUsers(
+      this.userIdsOf(game),
+      'gameStarted',
+      { game: this.toPublicGameState(game) },
+      game.gameId,
+    );
   }
 
   /**
@@ -143,32 +186,22 @@ export class GameService {
     const player: UserPlayer = { kind: 'user', userId, name };
     return this.retryOnChange(async () => {
       const waiting = await this.redisService.peekQueue();
-      // Random colors (ADR-10)
-      const game =
-        waiting &&
-        (Math.random() < 0.5
-          ? this.newGame(waiting.player, player)
-          : this.newGame(player, waiting.player));
-
-      const outcome = await this.redisService.joinQueue(
-        player,
-        waiting && game ? { waiting, game } : undefined,
-      );
+      const pairing = waiting && {
+        waiting,
+        game: this.newGame(waiting.player, player),
+      };
+      const outcome = await this.redisService.joinQueue(player, pairing);
       switch (outcome) {
         case 'queueChanged':
-          return undefined;
+          return CHANGED;
         case 'alreadyInQueue':
         case 'alreadyInGame':
           return this.refusal(outcome);
-        case 'matched':
-          this.broadcastToUsers(
-            this.userIdsOf(game!),
-            'gameStarted',
-            { game: this.toPublicGameState(game!) },
-            game!.gameId,
-          );
+        case 'queued':
           return { ok: true };
-        default:
+        case 'matched':
+          // Only a pairing can match.
+          this.announceStart(pairing!.game);
           return { ok: true };
       }
     }, 'Joining the queue');
@@ -198,27 +231,17 @@ export class GameService {
   async startBotGame(userId: string, name: string): Promise<OperationResponse> {
     const user: UserPlayer = { kind: 'user', userId, name };
     const bot: BotPlayer = { kind: 'bot', name: 'Stockfish bot' };
-
-    // Random colors (ADR-10)
-    const isUserWhite = Math.random() < 0.5;
-    const game = isUserWhite
-      ? this.newGame(user, bot)
-      : this.newGame(bot, user);
+    const game = this.newGame(user, bot);
 
     const refused = await this.redisService.startGame(userId, game);
     if (refused) {
       return this.refusal(refused);
     }
 
-    this.broadcastToUsers(
-      [userId],
-      'gameStarted',
-      { game: this.toPublicGameState(game) },
-      game.gameId,
-    );
+    this.announceStart(game);
 
     // If bot plays white, its first move arrives as moveMade (AsyncAPI contract)
-    if (!isUserWhite) {
+    if (game.white.kind === 'bot') {
       this.executeBotMoveAsync(game).catch((err) => {
         this.logger.error(`Error in bot first move: ${err.message}`);
       });
@@ -245,7 +268,7 @@ export class GameService {
     userId: string,
     gameId: string,
     uciMove: string,
-  ): Promise<OperationResponse | undefined> {
+  ): Promise<OperationResponse | typeof CHANGED> {
     const game = (await this.redisService.getGame(
       gameId,
     )) as ExtendedGameState | null;
@@ -256,10 +279,8 @@ export class GameService {
       };
     }
 
-    // Check if user is a player in this game
-    const isWhite = game.white.kind === 'user' && game.white.userId === userId;
-    const isBlack = game.black.kind === 'user' && game.black.userId === userId;
-    if (!isWhite && !isBlack) {
+    const color = colorOf(game, userId);
+    if (!color) {
       return {
         ok: false,
         error: {
@@ -269,12 +290,7 @@ export class GameService {
       };
     }
 
-    const currentTurnColor: Color =
-      game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
-    const isUserTurn =
-      (isWhite && currentTurnColor === 'white') ||
-      (isBlack && currentTurnColor === 'black');
-    if (!isUserTurn) {
+    if (turnOf(game) !== color) {
       return {
         ok: false,
         error: { code: 'notYourTurn', message: 'It is not your turn.' },
@@ -282,23 +298,18 @@ export class GameService {
     }
 
     const storedMoveCount = game.moves.length;
-
-    // Calculate elapsed time
     const now = Date.now();
-    const lastTimestamp =
-      game.lastMoveTimestamp ?? new Date(game.startedAt).getTime();
-    const elapsedMs = Math.max(0, now - lastTimestamp);
 
     const { updatedClock, timedOut } = ChessRules.updateClockOnMove(
       game.clock,
       game.white,
       game.black,
-      currentTurnColor,
-      elapsedMs,
+      color,
+      this.elapsedSinceLastMove(game, now),
     );
 
     if (timedOut) {
-      const evalRes = ChessRules.evaluateTimeout(game.fen, currentTurnColor);
+      const evalRes = ChessRules.evaluateTimeout(game.fen, color);
       const ended = await this.endGame(
         game,
         storedMoveCount,
@@ -306,7 +317,17 @@ export class GameService {
         evalRes.reason,
         updatedClock,
       );
-      return ended ? { ok: true } : undefined;
+      if (!ended) {
+        return CHANGED;
+      }
+      // The game ended on time before the move, so the move is not made (ADR-10).
+      return {
+        ok: false,
+        error: {
+          code: 'gameNotFound',
+          message: `Game ${gameId} ended on time before the move.`,
+        },
+      };
     }
 
     // Validate and apply move with chess.js
@@ -338,12 +359,12 @@ export class GameService {
         game.clock,
         this.moveMadeOf(game, uciMove),
       );
-      return ended ? { ok: true } : undefined;
+      return ended ? { ok: true } : CHANGED;
     }
 
     // The move is stored before anyone hears of it, so a move that another event has overtaken is never announced.
     if (!(await this.redisService.saveMove(game, storedMoveCount))) {
-      return undefined;
+      return CHANGED;
     }
     this.broadcastToUsers(
       this.userIdsOf(game),
@@ -352,11 +373,8 @@ export class GameService {
       gameId,
     );
 
-    // Check if next turn is the bot
-    const nextTurnColor: Color =
-      game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
-    const nextPlayer = nextTurnColor === 'white' ? game.white : game.black;
-    if (nextPlayer.kind === 'bot') {
+    // In a game against the bot the bot moves next.
+    if (game[turnOf(game)].kind === 'bot') {
       this.executeBotMoveAsync(game).catch((err) => {
         this.logger.error(`Error in bot move: ${err.message}`);
       });
@@ -397,14 +415,11 @@ export class GameService {
       return;
     }
 
-    const now = Date.now();
-    const botColor: Color = game.fen.split(' ')[1] === 'w' ? 'white' : 'black';
-
-    // Update clock: start opponent's clock
-    game.clock.running = botColor === 'white' ? 'black' : 'white';
     game.moves.push(botMove);
     game.fen = moveResult.fen!;
-    game.lastMoveTimestamp = now;
+    // The clock of the user runs again after the move of the bot.
+    game.clock.running = turnOf(game);
+    game.lastMoveTimestamp = Date.now();
 
     if (moveResult.isGameOver) {
       delete game.clock.running;
@@ -473,7 +488,7 @@ export class GameService {
   private async tryResign(
     userId: string,
     gameId: string,
-  ): Promise<OperationResponse | undefined> {
+  ): Promise<OperationResponse | typeof CHANGED> {
     const game = (await this.redisService.getGame(
       gameId,
     )) as ExtendedGameState | null;
@@ -484,9 +499,8 @@ export class GameService {
       };
     }
 
-    const isWhite = game.white.kind === 'user' && game.white.userId === userId;
-    const isBlack = game.black.kind === 'user' && game.black.userId === userId;
-    if (!isWhite && !isBlack) {
+    const color = colorOf(game, userId);
+    if (!color) {
       return {
         ok: false,
         error: {
@@ -496,7 +510,7 @@ export class GameService {
       };
     }
 
-    const result: GameResult = isWhite ? 'blackWon' : 'whiteWon';
+    const result: GameResult = color === 'white' ? 'blackWon' : 'whiteWon';
     const clock = this.currentClock(game, Date.now());
     delete clock.running;
 
@@ -507,7 +521,7 @@ export class GameService {
       'resignation',
       clock,
     );
-    return ended ? { ok: true } : undefined;
+    return ended ? { ok: true } : CHANGED;
   }
 
   /**
@@ -518,8 +532,8 @@ export class GameService {
       const game = (await this.redisService.getGame(
         gameId,
       )) as ExtendedGameState | null;
-      if (!game || game.clock.running !== timedOutColor) {
-        return null;
+      if (game?.clock.running !== timedOutColor) {
+        return;
       }
 
       const clock: Clock = { ...game.clock, [`${timedOutColor}Ms`]: 0 };
@@ -533,7 +547,10 @@ export class GameService {
         evalResult.reason,
         clock,
       );
-      return ended ? null : undefined;
+      if (!ended) {
+        return CHANGED;
+      }
+      this.logger.log(`Game ${gameId} ended on the time of ${timedOutColor}.`);
     }, 'A timeout');
   }
 
@@ -566,7 +583,7 @@ export class GameService {
     };
 
     const outboxEvent: GameFinishedEvent = {
-      id: uuidv7(),
+      id: randomUUIDv7(),
       type: 'game.finished.v1',
       source: 'game-service',
       time: endedAt,
